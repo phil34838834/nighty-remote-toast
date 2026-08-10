@@ -1,0 +1,12 @@
+# Local client state - never commit these, toast_client.json holds your token
+toast_client.json
+toast_client.log
+toast_client.log.old
+autostart_error.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Notes for the Discord thread, not part of the release
+DISCORD.md
