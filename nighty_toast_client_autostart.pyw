@@ -8,7 +8,7 @@ Same purpose as nighty_toast_client.pyw, with autostart built in.
   - Don't want it?   open nighty_toast_client.pyw instead.
 
 Double clicking this file opens a small panel to turn autostart on and off and
-to start the client. When Windows launches it at logon it passes `--boot` and
+to start or stop the client. When Windows launches it at logon it passes `--boot` and
 the client starts straight away, with no panel.
 
 It does not duplicate the client: it imports nighty_toast_client.pyw from the
@@ -34,7 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SELF = os.path.abspath(__file__)
 CLIENT = os.path.join(HERE, "nighty_toast_client.pyw")
 SHORTCUT_NAME = "Nighty Remote Toast.lnk"
-LOCK_PORT = 50787          # must match the client
+LOCK_PORT = 48888          # matches nighty_toast_client.pyw
 
 COLORS = {
     "bg": "#16171A", "card": "#1D1F24", "border": "#2A2C31",
@@ -73,8 +73,6 @@ def pythonw_exe():
 
 def enable():
     """Creates the Startup shortcut pointing at this script with --boot."""
-    # Paths travel through environment variables so quoting and non-ASCII
-    # characters can never break the PowerShell command.
     env = dict(os.environ,
                NT_LNK=shortcut_path(),
                NT_EXE=pythonw_exe(),
@@ -107,7 +105,15 @@ def disable():
 # ── client ──────────────────────────────────────────────────────────────────
 
 def client_running():
-    """Detected through the client's single-instance lock."""
+    """Detected through the client's Win32 mutex and socket lock."""
+    try:
+        import ctypes
+        mutex = ctypes.windll.kernel32.OpenMutexW(0x00100000, False, "Local\\NightyToastClient_Mutex")
+        if mutex:
+            ctypes.windll.kernel32.CloseHandle(mutex)
+            return True
+    except Exception:
+        pass
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("127.0.0.1", LOCK_PORT))
@@ -119,6 +125,56 @@ def client_running():
             s.close()
         except Exception:
             pass
+
+
+def find_client_pids():
+    """Finds PIDs of running nighty_toast_client instances."""
+    pids = set()
+    try:
+        r = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
+        )
+        for line in r.stdout.splitlines():
+            if f":{LOCK_PORT}" in line and "LISTENING" in line:
+                parts = line.strip().split()
+                pids.add(int(parts[-1]))
+    except Exception:
+        pass
+    try:
+        import psutil
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                name = proc.name().lower()
+                if "python" in name:
+                    cmd = " ".join(proc.cmdline() or [])
+                    if "nighty_toast_client.pyw" in cmd and proc.pid != os.getpid():
+                        pids.add(proc.pid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return list(pids)
+
+
+def stop_client():
+    """Terminates any running client processes."""
+    pids = find_client_pids()
+    stopped = False
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, text=True,
+                           creationflags=CREATE_NO_WINDOW)
+            stopped = True
+        except Exception:
+            pass
+        try:
+            os.kill(pid, 9)
+            stopped = True
+        except Exception:
+            pass
+    return stopped
 
 
 def import_client():
@@ -184,21 +240,25 @@ class Panel:
 
         self.btn_auto = self._button(body, "", self.toggle)
         self.btn_run = self._button(body, "Start client now", self.start)
+        self.btn_stop = self._button(body, "Stop Client", self.stop, danger=True)
         self._button(body, "Close", self.root.destroy, quiet=True)
 
         tk.Label(body, text="With autostart on, the client launches by itself\n"
-                            "every time you sign in to Windows.",
+                            "every time you sign in to Windows and runs in\n"
+                            "the system tray with the official Nighty icon.",
                  bg=COLORS["bg"], fg=COLORS["muted"], font=f_text,
                  justify="left").pack(anchor="w", pady=(12, 0))
 
         self.refresh()
         self.root.eval("tk::PlaceWindow . center")
+        self._poll_status()
 
-    def _button(self, parent, text, command, quiet=False):
+    def _button(self, parent, text, command, quiet=False, danger=False):
+        bg_col = COLORS["off"] if danger else (COLORS["card"] if quiet else COLORS["accent"])
+        fg_col = "#FFFFFF" if (danger or not quiet) else COLORS["text"]
         b = tk.Button(parent, text=text, command=command, font=self.f_button,
-                      bg=COLORS["card"] if quiet else COLORS["accent"],
-                      fg=COLORS["text"] if quiet else "#FFFFFF",
-                      activebackground=COLORS["border"] if quiet else COLORS["accent"],
+                      bg=bg_col, fg=fg_col,
+                      activebackground=COLORS["border"] if quiet else bg_col,
                       activeforeground="#FFFFFF",
                       relief="flat", bd=0, cursor="hand2", pady=8)
         b.pack(fill="x", pady=(0, 8))
@@ -216,9 +276,25 @@ class Panel:
         self.lbl_run.configure(
             text=("Client: running" if running else "Client: stopped"),
             fg=(COLORS["on"] if running else COLORS["muted"]))
+
         self.btn_run.configure(
             text=("Client is already running" if running else "Start client now"),
-            state=("disabled" if running else "normal"))
+            state=("disabled" if running else "normal"),
+            bg=(COLORS["card"] if running else COLORS["accent"]),
+            fg=(COLORS["muted"] if running else "#FFFFFF"))
+
+        self.btn_stop.configure(
+            text="Stop Client",
+            state=("normal" if running else "disabled"),
+            bg=(COLORS["off"] if running else COLORS["card"]),
+            fg=("#FFFFFF" if running else COLORS["muted"]))
+
+    def _poll_status(self):
+        try:
+            self.refresh()
+            self.root.after(2000, self._poll_status)
+        except Exception:
+            pass
 
     def toggle(self):
         try:
@@ -243,6 +319,14 @@ class Panel:
             messagebox.showerror("Nighty Remote Toast", f"Could not start:\n\n{e}")
             return
         self.root.after(1200, self.refresh)
+
+    def stop(self):
+        try:
+            stop_client()
+        except Exception as e:
+            messagebox.showerror("Nighty Remote Toast", f"Could not stop:\n\n{e}")
+            return
+        self.root.after(400, self.refresh)
 
     def run(self):
         self.root.mainloop()
