@@ -80,6 +80,7 @@ DEFAULTS = {
     "open_in_app": True,         # open the Discord app instead of the browser
     "progress_bar": False,       # original Nighty has no bottom progress bar
     "animate": True,             # slide + fade in
+    "monitor": "primary",        # "primary" | "secondary" | 1 | 2 (select which display shows toasts)
 
     # Obey `/settings toastsettings` from the VPS (side, duration_ms, image_url).
     # Set to false to let this file win.
@@ -482,6 +483,54 @@ def round_corners(window, width, height, radius=18):
         log(f"round_corners: {e}")
 
 
+def get_monitors():
+    """Returns a list of connected monitors with work areas (excluding taskbar)."""
+    monitors = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", wintypes.LONG),
+                ("top", wintypes.LONG),
+                ("right", wintypes.LONG),
+                ("bottom", wintypes.LONG),
+            ]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", RECT),
+                ("rcWork", RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        def _cb(hMonitor, hdcMonitor, lprcMonitor, dwData):
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            ctypes.windll.user32.GetMonitorInfoW(hMonitor, ctypes.byref(mi))
+            is_primary = bool(mi.dwFlags & 1)
+            r = mi.rcWork
+            monitors.append({
+                "index": len(monitors) + 1,
+                "primary": is_primary,
+                "x": r.left,
+                "y": r.top,
+                "width": r.right - r.left,
+                "height": r.bottom - r.top,
+            })
+            return True
+
+        MonitorEnumProc = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(RECT), wintypes.LPARAM
+        )
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, MonitorEnumProc(_cb), 0)
+    except Exception as e:
+        log(f"get_monitors error: {e}")
+    return monitors
+
+
 def draw_icon(canvas, x, y, kind, accent):
     """Draws the authentic Nighty vector circle icon (diameter 22px)."""
     # Circular outline
@@ -767,7 +816,9 @@ class Toast:
             self.deadline = time.time() + duration
             self._tick()
 
-    def move(self, y):
+    def move(self, y, x=None):
+        if x is not None:
+            self.target_x = x
         self.y = y
         try:
             self.win.geometry(f"+{self.target_x}+{y}")
@@ -968,6 +1019,47 @@ class ToastManager:
 
     def _init_tray(self):
         """Initializes the official Nighty System Tray Icon with status menu."""
+        def _tray_worker():
+            has_deps = False
+            try:
+                import pystray
+                from PIL import Image
+                has_deps = True
+            except ImportError:
+                log("pystray/Pillow missing; attempting automatic background installation via pip...")
+                exe = sys.executable
+                if os.path.basename(exe).lower() == "pythonw.exe":
+                    sibling = os.path.join(os.path.dirname(exe), "python.exe")
+                    if os.path.exists(sibling):
+                        exe = sibling
+                try:
+                    import subprocess
+                    subprocess.run(
+                        [exe, "-m", "pip", "install", "--quiet", "pystray", "pillow"],
+                        creationflags=0x08000000,
+                        check=True,
+                        timeout=60,
+                    )
+                    import pystray
+                    from PIL import Image
+                    has_deps = True
+                    log("pystray and Pillow successfully installed!")
+                except Exception as e:
+                    log(f"auto-install pystray/pillow failed: {e}")
+
+            if not has_deps:
+                self.root.after(2000, lambda: self.render({
+                    "title": "System Tray Notice",
+                    "text": "To enable the tray icon, please run: pip install pystray pillow",
+                    "type": "WARNING",
+                }))
+                return
+
+            self.root.after(0, self._setup_tray)
+
+        threading.Thread(target=_tray_worker, daemon=True).start()
+
+    def _setup_tray(self):
         try:
             import pystray
 
@@ -975,10 +1067,36 @@ class ToastManager:
             if tray_img is None:
                 return
 
+            monitors = get_monitors()
+            def _is_mon_checked(val):
+                cur = self.cfg.get("monitor", "primary")
+                if str(cur).lower() in ("primary", "main", "1st") and str(val).lower() in ("primary", "main", "1st"):
+                    return True
+                if str(cur).lower() in ("secondary", "second", "2nd") and str(val).lower() in ("secondary", "second", "2nd"):
+                    return True
+                return str(cur) == str(val)
+
+            display_items = [
+                pystray.MenuItem("Primary Display", lambda _: self._tray_set_monitor("primary"),
+                                 checked=lambda item: _is_mon_checked("primary")),
+            ]
+            if len(monitors) > 1:
+                display_items.append(
+                    pystray.MenuItem("Secondary Display", lambda _: self._tray_set_monitor("secondary"),
+                                     checked=lambda item: _is_mon_checked("secondary"))
+                )
+            for idx, m in enumerate(monitors, 1):
+                label = f"Monitor {idx} ({m['width']}x{m['height']})" + (" [Primary]" if m["primary"] else "")
+                display_items.append(
+                    pystray.MenuItem(label, lambda _, i=idx: self._tray_set_monitor(i),
+                                     checked=lambda item, i=idx: _is_mon_checked(i))
+                )
+
             menu = pystray.Menu(
                 pystray.MenuItem("Nighty Remote Toast", None, enabled=False),
                 pystray.MenuItem(lambda item: f"Status: {'Connected' if self.online else 'Connecting...'}", None, enabled=False),
                 pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Display", pystray.Menu(*display_items)),
                 pystray.MenuItem("Send Test Toast", self._tray_test_toast, default=True),
                 pystray.MenuItem("Open Settings (JSON)", self._tray_open_settings),
                 pystray.MenuItem("Open Log", self._tray_open_log),
@@ -998,6 +1116,23 @@ class ToastManager:
         except Exception as e:
             log(f"tray icon init failed: {e}")
             self.tray_icon = None
+
+    def _tray_set_monitor(self, mon_val):
+        self.cfg["monitor"] = mon_val
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            data["monitor"] = mon_val
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            log(f"failed to save monitor setting: {e}")
+        self.root.after(0, self.relayout)
+        self.root.after(0, lambda: self.render({
+            "title": "Display Changed",
+            "text": f"Toasts will now appear on {mon_val} display.",
+            "type": "INFO",
+        }))
 
     def _tray_test_toast(self, _icon=None, _item=None):
         self.root.after(0, lambda: self.render({
@@ -1075,6 +1210,36 @@ class ToastManager:
 
     # -- placement ----------------------------------------------------------
 
+    def get_monitor_geometry(self):
+        monitors = get_monitors()
+        if not monitors:
+            return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        target = self.cfg.get("monitor", "primary")
+        if isinstance(target, str):
+            t = target.lower().strip()
+            if t in ("primary", "main", "1st"):
+                for m in monitors:
+                    if m["primary"]:
+                        return m["x"], m["y"], m["width"], m["height"]
+                return monitors[0]["x"], monitors[0]["y"], monitors[0]["width"], monitors[0]["height"]
+            elif t in ("secondary", "second", "2nd"):
+                for m in monitors:
+                    if not m["primary"]:
+                        return m["x"], m["y"], m["width"], m["height"]
+                return monitors[0]["x"], monitors[0]["y"], monitors[0]["width"], monitors[0]["height"]
+            try:
+                target = int(target)
+            except ValueError:
+                target = 1
+        if isinstance(target, int):
+            if 1 <= target <= len(monitors):
+                m = monitors[target - 1]
+                return m["x"], m["y"], m["width"], m["height"]
+        for m in monitors:
+            if m["primary"]:
+                return m["x"], m["y"], m["width"], m["height"]
+        return monitors[0]["x"], monitors[0]["y"], monitors[0]["width"], monitors[0]["height"]
+
     def on_top(self):
         return str(self.cfg.get("position", "top-right")).startswith("top")
 
@@ -1082,30 +1247,35 @@ class ToastManager:
         return str(self.cfg.get("position", "top-right")).endswith("left")
 
     def x_for(self, width):
+        mx, my, mw, mh = self.get_monitor_geometry()
         margin = int(self.cfg.get("margin_x", 24))
         if self.on_left():
-            return margin
-        return self.root.winfo_screenwidth() - width - margin
+            return mx + margin
+        return mx + mw - width - margin
 
     def relayout(self):
+        mx, my, mw, mh = self.get_monitor_geometry()
         margin = int(self.cfg.get("margin_y", 24))
         if self.on_top():
-            y = margin
+            y = my + margin
             for t in self.active:
-                t.move(y)
+                x = self.x_for(t.width)
+                t.move(y, x=x)
                 y += t.height + self.GAP
         else:
-            y = self.root.winfo_screenheight() - margin
+            y = my + mh - margin
             for t in self.active:
                 y -= t.height
-                t.move(y)
+                x = self.x_for(t.width)
+                t.move(y, x=x)
                 y -= self.GAP
 
     def next_y(self, height):
+        mx, my, mw, mh = self.get_monitor_geometry()
         margin = int(self.cfg.get("margin_y", 24))
         if self.on_top():
-            return margin + sum(t.height + self.GAP for t in self.active)
-        base = self.root.winfo_screenheight() - margin
+            return my + margin + sum(t.height + self.GAP for t in self.active)
+        base = my + mh - margin
         base -= sum(t.height + self.GAP for t in self.active)
         return base - height
 
