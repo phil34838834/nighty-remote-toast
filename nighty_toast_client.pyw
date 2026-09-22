@@ -1097,8 +1097,7 @@ class ToastManager:
                 pystray.MenuItem(lambda item: f"Status: {'Connected' if self.online else 'Connecting...'}", None, enabled=False),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Display", pystray.Menu(*display_items)),
-                pystray.MenuItem("Send Test Toast", self._tray_test_toast, default=True),
-                pystray.MenuItem("Open Settings (JSON)", self._tray_open_settings),
+                pystray.MenuItem("Open Settings (JSON)", self._tray_open_settings, default=True),
                 pystray.MenuItem("Open Log", self._tray_open_log),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Restart Client", self._tray_restart),
@@ -1132,13 +1131,6 @@ class ToastManager:
             "title": "Display Changed",
             "text": f"Toasts will now appear on {mon_val} display.",
             "type": "INFO",
-        }))
-
-    def _tray_test_toast(self, _icon=None, _item=None):
-        self.root.after(0, lambda: self.render({
-            "title": "Nighty Remote Toast",
-            "text": "Tray icon is active and client is running properly!",
-            "type": "SUCCESS",
         }))
 
     def _tray_open_settings(self, _icon=None, _item=None):
