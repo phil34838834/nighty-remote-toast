@@ -81,6 +81,8 @@ DEFAULTS = {
     "progress_bar": False,       # original Nighty has no bottom progress bar
     "animate": True,             # slide + fade in
     "monitor": "primary",        # "primary" | "secondary" | 1 | 2 (select which display shows toasts)
+    "dnd": False,                # Do Not Disturb: mute toast popups
+    "suppress_in_fullscreen": True, # Automatically mute toasts when playing fullscreen games
 
     # Obey `/settings toastsettings` from the VPS (side, duration_ms, image_url).
     # Set to false to let this file win.
@@ -531,6 +533,91 @@ def get_monitors():
     return monitors
 
 
+def is_foreground_fullscreen():
+    """Returns True if the current active foreground window is in fullscreen (e.g. game)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd or hwnd == user32.GetShellWindow():
+            return False
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", wintypes.LONG),
+                ("top", wintypes.LONG),
+                ("right", wintypes.LONG),
+                ("bottom", wintypes.LONG),
+            ]
+
+        w_rect = RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(w_rect))
+        hmon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        if not hmon:
+            return False
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", RECT),
+                ("rcWork", RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+        m = mi.rcMonitor
+        return (w_rect.left <= m.left and w_rect.top <= m.top and
+                w_rect.right >= m.right and w_rect.bottom >= m.bottom)
+    except Exception:
+        return False
+
+
+def is_autostart_enabled():
+    lnk = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
+                       "Start Menu", "Programs", "Startup", "Nighty Remote Toast.lnk")
+    return os.path.exists(lnk)
+
+
+def set_autostart(enable=True):
+    lnk = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
+                       "Start Menu", "Programs", "Startup", "Nighty Remote Toast.lnk")
+    if enable:
+        autostart_file = os.path.join(HERE, "nighty_toast_client_autostart.pyw")
+        target_file = autostart_file if os.path.exists(autostart_file) else os.path.join(HERE, "nighty_toast_client.pyw")
+        exe = sys.executable
+        if os.path.basename(exe).lower() == "python.exe":
+            sibling = os.path.join(os.path.dirname(exe), "pythonw.exe")
+            if os.path.exists(sibling):
+                exe = sibling
+        env = dict(os.environ,
+                   NT_LNK=lnk,
+                   NT_EXE=exe,
+                   NT_ARGS=f'"{target_file}" --boot',
+                   NT_DIR=HERE)
+        script = (
+            '$ws = New-Object -ComObject WScript.Shell; '
+            '$l = $ws.CreateShortcut($env:NT_LNK); '
+            '$l.TargetPath = $env:NT_EXE; '
+            '$l.Arguments = $env:NT_ARGS; '
+            '$l.WorkingDirectory = $env:NT_DIR; '
+            '$l.Description = "Nighty Remote Toast - local client"; '
+            '$l.Save()'
+        )
+        import subprocess
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            env=env, capture_output=True, text=True, creationflags=0x08000000,
+        )
+    else:
+        try:
+            os.remove(lnk)
+        except FileNotFoundError:
+            pass
+
+
 def draw_icon(canvas, x, y, kind, accent):
     """Draws the authentic Nighty vector circle icon (diameter 22px)."""
     # Circular outline
@@ -975,6 +1062,10 @@ class ToastManager:
         self.default_icon = None      # from /settings toastsettings image_url
         self.vps_settings = {}
 
+        self.history = []
+        self.dnd = bool(cfg.get("dnd", False))
+        self.suppress_fullscreen = bool(cfg.get("suppress_in_fullscreen", True))
+
         self.reader = SSEReader(cfg, self.queue)
         self.reader.start()
         self.root.after(100, self.pump)
@@ -1059,6 +1150,32 @@ class ToastManager:
 
         threading.Thread(target=_tray_worker, daemon=True).start()
 
+    def _get_history_menu_items(self):
+        import pystray
+        if not self.history:
+            return [pystray.MenuItem("No recent notifications", None, enabled=False)]
+        items = []
+        for h in self.history:
+            url = h.get("url")
+            preview = (h.get("text") or "").strip()
+            if len(preview) > 36:
+                preview = preview[:35] + "…"
+            title = h.get("title") or "Nighty"
+            label = f"[{h['time']}] {title}: {preview}" if preview else f"[{h['time']}] {title}"
+            items.append(
+                pystray.MenuItem(
+                    label,
+                    (lambda _, u=url: open_url(u, bool(self.cfg.get("open_in_app", True)))) if url else None,
+                    enabled=bool(url)
+                )
+            )
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem("Clear History", self._tray_clear_history))
+        return items
+
+    def _tray_clear_history(self, _icon=None, _item=None):
+        self.history.clear()
+
     def _setup_tray(self):
         try:
             import pystray
@@ -1096,7 +1213,16 @@ class ToastManager:
                 pystray.MenuItem("Nighty Remote Toast", None, enabled=False),
                 pystray.MenuItem(lambda item: f"Status: {'Connected' if self.online else 'Connecting...'}", None, enabled=False),
                 pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Recent Notifications", pystray.Menu(self._get_history_menu_items)),
                 pystray.MenuItem("Display", pystray.Menu(*display_items)),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Do Not Disturb (Mute)", self._tray_toggle_dnd,
+                                 checked=lambda item: self.dnd),
+                pystray.MenuItem("Mute in Fullscreen", self._tray_toggle_fullscreen,
+                                 checked=lambda item: self.suppress_fullscreen),
+                pystray.MenuItem("Start with Windows", self._tray_toggle_autostart,
+                                 checked=lambda item: is_autostart_enabled()),
+                pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Open Settings (JSON)", self._tray_open_settings, default=True),
                 pystray.MenuItem("Open Log", self._tray_open_log),
                 pystray.Menu.SEPARATOR,
@@ -1116,16 +1242,42 @@ class ToastManager:
             log(f"tray icon init failed: {e}")
             self.tray_icon = None
 
-    def _tray_set_monitor(self, mon_val):
-        self.cfg["monitor"] = mon_val
+    def _tray_toggle_dnd(self, _icon=None, _item=None):
+        self.dnd = not self.dnd
+        self.cfg["dnd"] = self.dnd
+        self._save_cfg()
+        if self.dnd:
+            self.root.after(0, self.close_all)
+        else:
+            self.root.after(0, lambda: self.render({
+                "title": "Do Not Disturb",
+                "text": "DND disabled. Notifications are now active.",
+                "type": "INFO",
+            }))
+
+    def _tray_toggle_fullscreen(self, _icon=None, _item=None):
+        self.suppress_fullscreen = not self.suppress_fullscreen
+        self.cfg["suppress_in_fullscreen"] = self.suppress_fullscreen
+        self._save_cfg()
+
+    def _tray_toggle_autostart(self, _icon=None, _item=None):
+        set_autostart(not is_autostart_enabled())
+
+    def _save_cfg(self):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
-            data["monitor"] = mon_val
+            data["dnd"] = self.dnd
+            data["suppress_in_fullscreen"] = self.suppress_fullscreen
+            data["monitor"] = self.cfg.get("monitor", "primary")
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
-            log(f"failed to save monitor setting: {e}")
+            log(f"failed to save config: {e}")
+
+    def _tray_set_monitor(self, mon_val):
+        self.cfg["monitor"] = mon_val
+        self._save_cfg()
         self.root.after(0, self.relayout)
         self.root.after(0, lambda: self.render({
             "title": "Display Changed",
@@ -1317,6 +1469,27 @@ class ToastManager:
             return
         if event.get("kind") == "toast":
             if not self._is_duplicate(event):
+                # 1. Record in history for "Recent Notifications"
+                self.history.insert(0, {
+                    "title": event.get("title") or "Nighty",
+                    "text": event.get("text") or "",
+                    "url": event.get("url"),
+                    "time": time.strftime("%H:%M"),
+                    "type": event.get("type", "INFO"),
+                })
+                if len(self.history) > 10:
+                    self.history.pop()
+
+                # 2. Check Do Not Disturb
+                if self.dnd:
+                    log("suppressed toast: DND active")
+                    return
+
+                # 3. Check Fullscreen Game suppression
+                if self.suppress_fullscreen and is_foreground_fullscreen():
+                    log("suppressed toast: foreground window is fullscreen")
+                    return
+
                 self.render(event)
 
     def _is_duplicate(self, event):
