@@ -53,44 +53,34 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "toast_client.json")
 LOG_PATH = os.path.join(HERE, "toast_client.log")
 
-LOG_LIMIT = 512 * 1024                   # rotate past 512 KB
-LOCK_PORT = 48888                        # local port used only as a single-instance lock
-
-# --boot is set by the autostart shortcut. It silences dialogs that make no
-# sense while Windows is still logging in.
+LOG_LIMIT = 512 * 1024
+LOCK_PORT = 48888
 QUIET = "--boot" in sys.argv
-
-_lock = None                             # socket held for the life of the process
-
+_lock = None
 
 DEFAULTS = {
     "scheme": "http",
     "host": "YOUR_VPS_IP",
     "port": 8787,
     "token": "PASTE_YOUR_TOKEN_HERE",
-
-    "position": "top-right",     # top-left | top-right | bottom-left | bottom-right
+    "position": "top-right",
     "margin_x": 24,
     "margin_y": 24,
     "width": 510,
-    "duration": 8,               # seconds on screen (0 = stay until clicked)
+    "duration": 8,
     "max_visible": 4,
-    "avatar": False,             # original Nighty uses the authentic vector circle icons
+    "avatar": False,
     "avatar_circular": True,
     "sound": False,
-    "open_in_app": True,         # open the Discord app instead of the browser
-    "progress_bar": False,       # original Nighty has no bottom progress bar
-    "animate": True,             # slide + fade in
-    "monitor": "primary",        # "primary" | "secondary" | 1 | 2 (select which display shows toasts)
-    "dnd": False,                # Do Not Disturb: mute toast popups
-    "suppress_in_fullscreen": True, # Automatically mute toasts when playing fullscreen games
-
-    # Obey `/settings toastsettings` from the VPS (side, duration_ms, image_url).
-    # Set to false to let this file win.
+    "open_in_app": True,
+    "progress_bar": False,
+    "animate": True,
+    "monitor": "primary",
+    "dnd": False,
+    "suppress_in_fullscreen": True,
     "follow_vps": True,
 }
 
-# Authentic Nighty palette & styling
 TARGET_ALPHA = 0.92
 
 COLORS = {
@@ -103,10 +93,10 @@ COLORS = {
 }
 
 ACCENTS = {
-    "INFO": "#40A0C6",           # Nighty cyan/blue
-    "SUCCESS": "#43B581",        # Emerald green
-    "ERROR": "#ED4245",          # Red
-    "WARNING": "#FAA61A",        # Amber
+    "INFO": "#40A0C6",
+    "SUCCESS": "#43B581",
+    "ERROR": "#ED4245",
+    "WARNING": "#FAA61A",
 }
 
 GRADIENTS = {
@@ -116,14 +106,12 @@ GRADIENTS = {
     "WARNING": ((4, 3, 1), (24, 16, 4)),
 }
 
-# Official Nighty 'N' logo URL
 NIGHTY_LOGO_URL = (
     "https://nighty.one/_next/image?url=%2Fassets%2Fimg%2Fnighty%40500px.png&w=32&q=75"
 )
 
 
 def init_log():
-    """Clears the log file on client startup/restart and writes a fresh session header."""
     try:
         with open(LOG_PATH, "w", encoding="utf-8") as f:
             f.write(
@@ -150,8 +138,6 @@ def safe_float(val, default):
 
 def log(msg):
     try:
-        # Under autostart this runs for weeks, so the log has to be capped.
-        # Keeps at most the current file plus one .old.
         if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_LIMIT:
             os.replace(LOG_PATH, LOG_PATH + ".old")
         with open(LOG_PATH, "a", encoding="utf-8", errors="ignore") as f:
@@ -161,7 +147,6 @@ def log(msg):
 
 
 def alert(title, message, kind="info"):
-    """Simple dialog. A .pyw has no console, so errors need somewhere to show."""
     from tkinter import messagebox
     root = tk.Tk()
     root.withdraw()
@@ -179,18 +164,8 @@ _manager_instance = None
 
 
 def ensure_single_instance():
-    """Guarantees that it is impossible to have two instances running simultaneously.
-
-    1. Checks a Win32 Named Mutex ('Local\\NightyToastClient_Mutex').
-    2. Binds a local TCP socket on 127.0.0.1:48888.
-    3. If another instance is already running:
-       Sends a 'WAKEUP' ping to the existing instance so it brings up a toast
-       notifying the user that it is already active in the system tray,
-       and then this process exits immediately without spawning another instance.
-    """
     global _mutex, _lock_socket
 
-    # 1. Win32 Named Mutex
     try:
         import ctypes
         ERROR_ALREADY_EXISTS = 183
@@ -202,7 +177,6 @@ def ensure_single_instance():
     except Exception as e:
         log(f"mutex check warning: {e}")
 
-    # 2. Local Socket Lock
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("127.0.0.1", LOCK_PORT))
@@ -216,7 +190,6 @@ def ensure_single_instance():
         _notify_existing_and_exit()
         return False
 
-    # Start listener thread for wakeup pings from subsequent launch attempts
     def _listen_for_pings():
         while True:
             try:
@@ -234,7 +207,6 @@ def ensure_single_instance():
 
 
 def _notify_existing_and_exit():
-    """Signals the existing instance that another launch was attempted, then exits immediately."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(1.5)
@@ -254,11 +226,8 @@ def load_config():
         return None
     cfg = dict(DEFAULTS)
     try:
-        # utf-8-sig: Windows Notepad saves JSON with a BOM and the plain parser
-        # chokes on it. Reading with -sig accepts the file either way.
         with open(CONFIG_PATH, "r", encoding="utf-8-sig", errors="ignore") as f:
             raw = f.read()
-        # Clean trailing commas (e.g. ", }" or ", ]") and comments
         cleaned = re.sub(r",\s*([\]}])", r"\1", raw)
         cleaned = re.sub(r"//.*", "", cleaned)
         cfg.update(json.loads(cleaned) or {})
@@ -271,13 +240,6 @@ def load_config():
         return False
     return cfg
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# SSE reader
-#
-# Runs on its own thread and pushes events into a Queue. tkinter may only be
-# touched from the main thread, so the UI drains that queue via root.after.
-# ══════════════════════════════════════════════════════════════════════════
 
 class SSEReader(threading.Thread):
     def __init__(self, cfg, out):
@@ -299,7 +261,7 @@ class SSEReader(threading.Thread):
         while not self.stop.is_set():
             try:
                 self.connect()
-                backoff = 1          # connected then dropped: retry quickly
+                backoff = 1
             except urllib.error.HTTPError as e:
                 if e.code == 401:
                     self.out.put({"_status": "auth", "detail": "token rejected (401)"})
@@ -322,8 +284,6 @@ class SSEReader(threading.Thread):
             "Cache-Control": "no-cache",
             "Authorization": f"Bearer {self.cfg['token']}",
         })
-        # Longer than the server's 20s keepalive, otherwise an idle connection
-        # gets torn down for no reason.
         response = urllib.request.urlopen(req, timeout=60)
         self.out.put({"_status": "online"})
         log("connected")
@@ -334,12 +294,12 @@ class SSEReader(threading.Thread):
                 break
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
 
-            if line == "":                        # end of event
+            if line == "":
                 if payload:
                     self.dispatch("\n".join(payload))
                     payload = []
                 continue
-            if line.startswith(":"):              # comment / keepalive
+            if line.startswith(":"):
                 continue
             if line.startswith("data:"):
                 payload.append(line[5:].lstrip())
@@ -362,14 +322,7 @@ class SSEReader(threading.Thread):
         self.out.put(event)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# Images & Graphics Helpers
-# ══════════════════════════════════════════════════════════════════════════
-
 class AvatarCache:
-    """Downloads and converts avatars. Tk only reads PNG/GIF, so we ask the
-    Discord CDN for PNG explicitly."""
-
     def __init__(self, enabled=False, circular=True, size=22):
         self.enabled = enabled
         self.circular = circular
@@ -418,7 +371,6 @@ class AvatarCache:
         return image
 
     def get_icon(self, url):
-        """Generic icon (the image_url from /settings toastsettings)."""
         if not url:
             return None
         if url in self.cache:
@@ -441,7 +393,6 @@ class AvatarCache:
 
     @staticmethod
     def mask_circle(image):
-        """Circular mask via transparency_set (Tk 8.6+), no PIL needed."""
         try:
             width, height = image.width(), image.height()
             cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
@@ -459,7 +410,6 @@ class AvatarCache:
 
 
 def make_gradient_ppm(w, h, c1, c2):
-    """Generates an in-memory binary PPM image with a smooth horizontal gradient."""
     w = max(1, int(w))
     h = max(1, int(h))
     row = bytearray()
@@ -473,7 +423,6 @@ def make_gradient_ppm(w, h, c1, c2):
 
 
 def make_rounded_gradient(w, h, c1, c2, radius=18):
-    """Generates an in-memory PNG image with a smooth horizontal gradient and rounded corners."""
     try:
         from PIL import Image, ImageDraw
         import io
@@ -502,7 +451,6 @@ def make_rounded_gradient(w, h, c1, c2, radius=18):
 
 
 def round_corners(window, width, height, radius=18):
-    """Applies true OS-level rounded window corners on Windows via GDI region."""
     try:
         import ctypes
         window.update_idletasks()
@@ -519,7 +467,6 @@ def round_corners(window, width, height, radius=18):
 
 
 def get_monitors():
-    """Returns a list of connected monitors with work areas (excluding taskbar)."""
     monitors = []
     try:
         import ctypes
@@ -567,7 +514,6 @@ def get_monitors():
 
 
 def is_foreground_fullscreen():
-    """Returns True if the current active foreground window is in fullscreen (e.g. game)."""
     try:
         import ctypes
         from ctypes import wintypes
@@ -586,7 +532,7 @@ def is_foreground_fullscreen():
 
         w_rect = RECT()
         user32.GetWindowRect(hwnd, ctypes.byref(w_rect))
-        hmon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        hmon = user32.MonitorFromWindow(hwnd, 2)
         if not hmon:
             return False
 
@@ -652,24 +598,18 @@ def set_autostart(enable=True):
 
 
 def draw_icon(canvas, x, y, kind, accent):
-    """Draws the authentic Nighty vector circle icon (diameter 22px)."""
-    # Circular outline
     canvas.create_oval(x, y, x + 22, y + 22, outline=accent, width=2)
 
     if kind == "SUCCESS":
-        # Checkmark ✓
         canvas.create_line(x + 6, y + 11, x + 10, y + 16, fill=accent, width=2, capstyle="round")
         canvas.create_line(x + 10, y + 16, x + 17, y + 6, fill=accent, width=2, capstyle="round")
     elif kind == "ERROR":
-        # Exclamation mark !
         canvas.create_line(x + 11, y + 5, x + 11, y + 13, fill=accent, width=2, capstyle="round")
         canvas.create_oval(x + 10, y + 15, x + 12, y + 17, fill=accent, outline=accent)
     elif kind == "WARNING":
-        # Exclamation mark !
         canvas.create_line(x + 11, y + 5, x + 11, y + 13, fill=accent, width=2, capstyle="round")
         canvas.create_oval(x + 10, y + 15, x + 12, y + 17, fill=accent, outline=accent)
     else:
-        # INFO: 'i'
         canvas.create_oval(x + 10, y + 4, x + 12, y + 6, fill=accent, outline=accent)
         canvas.create_line(x + 11, y + 8, x + 11, y + 17, fill=accent, width=2)
 
@@ -701,7 +641,6 @@ class Toast:
         accent = ACCENTS.get(kind, ACCENTS["INFO"])
         c1, c2 = GRADIENTS.get(kind, GRADIENTS["INFO"])
 
-        # Nighty width: standard is ~510px matching original screenshots
         w = safe_int(self.cfg.get("width"), 510)
         if w <= 0 or w == 380:
             w = 510
@@ -724,11 +663,9 @@ class Toast:
         body_text = (event.get("text") or "").strip()
         footer_text = self._footer(event)
 
-        # Content column offset to place it beside the Nighty 'N' logo
         content_x = 78
         wrap_width = max(200, w - content_x - 32)
 
-        # Measure content height dynamically
         current_bottom = 40
         t_id = None
         if body_text:
@@ -759,30 +696,25 @@ class Toast:
         self.canvas.configure(height=self.height)
         round_corners(self.win, w, self.height, radius=18)
 
-        # Draw gradient background (smooth anti-aliased rounded rectangle)
         self._bg_img = tk.PhotoImage(data=make_rounded_gradient(w, self.height, c1, c2, radius=18))
         self.canvas.create_image(0, 0, image=self._bg_img, anchor="nw")
 
-        # Nighty 'N' logo placed beside the content, vertically centered
         self.logo_item = None
         if manager.nighty_logo is not None:
             logo_y = (self.height - manager.nighty_logo.height()) // 2
             self.logo_item = self.canvas.create_image(22, logo_y, image=manager.nighty_logo, anchor="nw")
 
-        # Notification Type Icon (i / ✓ / !) - Uniform authentic Nighty design across ALL notifications
         icon_x = content_x
         icon_y = 18
         draw_icon(self.canvas, icon_x, icon_y, kind, accent)
         title_x = icon_x + 34
         title_y = icon_y + 11
 
-        # Title
         self.canvas.create_text(
             title_x, title_y, text=title_text,
             fill=COLORS["title"], font=manager.f_title, anchor="w"
         )
 
-        # Close button ('✕') at top-right
         cx, cy = w - 30, 28
         self.close_l1 = self.canvas.create_line(
             cx - 6, cy - 6, cx + 6, cy + 6,
@@ -792,10 +724,8 @@ class Toast:
             cx + 6, cy - 6, cx - 6, cy + 6,
             fill=COLORS["close"], width=2.5, capstyle="round", tags="close"
         )
-        # Larger hit area for easy click
         self.canvas.create_rectangle(w - 52, 0, w, 52, fill="", outline="", tags="close")
 
-        # Redraw text above the background
         if body_text:
             self.canvas.create_text(
                 content_x, 52, text=body_text,
@@ -807,13 +737,11 @@ class Toast:
                 fill=COLORS["footer"], font=manager.f_footer, anchor="nw", width=wrap_width
             )
 
-        # Remove temporary measurement text objects
         if t_id:
             self.canvas.delete(t_id)
         if f_id:
             self.canvas.delete(f_id)
 
-        # Context menu
         self.menu = tk.Menu(self.win, tearoff=0)
         url = event.get("url")
         if url:
@@ -826,12 +754,10 @@ class Toast:
         self.menu.add_separator()
         self.menu.add_command(label="Quit client", command=manager.quit)
 
-        # Close button interactions
         self.canvas.tag_bind("close", "<Button-1>", self.on_close_click)
         self.canvas.tag_bind("close", "<Enter>", self.on_close_enter)
         self.canvas.tag_bind("close", "<Leave>", self.on_close_leave)
 
-        # Toast-wide interactions
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Button-3>", self.on_menu)
         self.canvas.bind("<Enter>", self.on_enter)
@@ -839,8 +765,6 @@ class Toast:
 
         if event.get("url"):
             self.canvas.configure(cursor="hand2")
-
-    # -- helpers -----------------------------------------------------------
 
     @staticmethod
     def _clip(text, limit):
@@ -865,15 +789,12 @@ class Toast:
         return "  ·  ".join(parts)
 
     def update_logo(self):
-        """Draws the Nighty logo if it finishes downloading while toast is visible."""
         if self.manager.nighty_logo is not None and self.logo_item is None and not self.closing:
             try:
                 logo_y = (self.height - self.manager.nighty_logo.height()) // 2
                 self.logo_item = self.canvas.create_image(22, logo_y, image=self.manager.nighty_logo, anchor="nw")
             except Exception:
                 pass
-
-    # -- interaction --------------------------------------------------------
 
     def on_close_click(self, _e=None):
         self.close()
@@ -936,8 +857,6 @@ class Toast:
         except (tk.TclError, AttributeError):
             pass
 
-    # -- lifecycle & smooth ease-out animation ------------------------------
-
     def show(self, y):
         x = self.manager.x_for(self.width)
         self.target_x = x
@@ -973,15 +892,12 @@ class Toast:
             pass
 
     def _animate_in(self):
-        """Smooth cubic ease-out slide-in + fade-in animation."""
         if self.closing:
             return
         self._anim_step += 1
         t = min(1.0, self._anim_step / self._anim_total)
-        # Cubic ease-out: 1 - (1 - t)^3
         progress = 1.0 - (1.0 - t) ** 3
         cur_x = int(self.target_x + self.offset * (1.0 - progress))
-        # Quadratic ease-out for alpha
         self.alpha = TARGET_ALPHA * (1.0 - (1.0 - t) ** 2)
 
         try:
@@ -1000,7 +916,6 @@ class Toast:
                 pass
 
     def _tick(self):
-        """Countdown dismiss timer; pauses while mouse hovers."""
         if self.closing:
             return
         try:
@@ -1031,7 +946,6 @@ class Toast:
         self._fade_out()
 
     def _fade_out(self):
-        """Smooth ease-in fade-out animation."""
         self._close_step += 1
         t = min(1.0, self._close_step / self._close_total)
         fade = max(0.0, TARGET_ALPHA * (1.0 - t ** 2))
@@ -1047,12 +961,6 @@ class Toast:
 
 
 def open_url(url, prefer_app=True):
-    """Try the Discord app first, fall back to the browser.
-
-    Two shapes arrive: showDM sends jump_url (https://discord.com/channels/...)
-    and the Notification Center sends discord://discord.com/channels/... . Both
-    become the canonical discord://-/channels/... that the app understands.
-    """
     if not url:
         return
 
@@ -1081,10 +989,6 @@ def open_url(url, prefer_app=True):
         log(f"browser failed: {e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# Manager: toast stack + queue pump
-# ══════════════════════════════════════════════════════════════════════════
-
 class ToastManager:
     GAP = 12
 
@@ -1107,11 +1011,9 @@ class ToastManager:
         self.f_text = tkfont.Font(family="Segoe UI", size=11)
         self.f_footer = tkfont.Font(family="Segoe UI", size=9)
 
-        # Fetch official Nighty logo from URL asynchronously
         self.nighty_logo = None
         self._load_logo()
 
-        # Initialize official Nighty System Tray Icon
         self._init_tray()
 
         self.avatars = AvatarCache(
@@ -1119,7 +1021,7 @@ class ToastManager:
             circular=bool(cfg.get("avatar_circular", True)),
             size=22,
         )
-        self.default_icon = None      # from /settings toastsettings image_url
+        self.default_icon = None
         self.vps_settings = {}
 
         self.history = []
@@ -1131,7 +1033,6 @@ class ToastManager:
         self.root.after(100, self.pump)
 
     def on_second_instance_launch(self):
-        """Notifies the user via toast when a second launch attempt is blocked."""
         self.render({
             "title": "Nighty Remote Toast",
             "text": "Client is already running in the system tray!",
@@ -1139,7 +1040,6 @@ class ToastManager:
         })
 
     def _create_tray_image(self):
-        """Generates the official Nighty 'N' tray icon (64x64 RGBA)."""
         try:
             from PIL import Image, ImageDraw
             import io
@@ -1156,7 +1056,6 @@ class ToastManager:
                 except Exception:
                     pass
 
-            # Fallback vector 'N' icon
             canvas = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
             draw = ImageDraw.Draw(canvas)
             draw.rounded_rectangle((2, 2, 61, 61), radius=16, fill=(1, 4, 24, 255), outline=(64, 160, 198, 255), width=2)
@@ -1169,7 +1068,6 @@ class ToastManager:
             return None
 
     def _init_tray(self):
-        """Initializes the official Nighty System Tray Icon with status menu."""
         def _tray_worker():
             has_deps = False
             try:
@@ -1310,7 +1208,6 @@ class ToastManager:
             self.tray_icon = None
 
     def _update_tray_status(self):
-        """Syncs the tray icon tooltip and menu items with the current connection status."""
         if not self.tray_icon:
             return
         try:
@@ -1323,7 +1220,6 @@ class ToastManager:
             log(f"update_tray_status error: {e}")
 
     def _tray_show_status(self, _icon=None, _item=None):
-        """Displays a quick status toast notification when left-clicking the tray icon."""
         mon = self.cfg.get("monitor", "primary")
         dnd_str = "ON" if self.dnd else "OFF"
         fs_str = "ON" if self.suppress_fullscreen else "OFF"
@@ -1373,7 +1269,6 @@ class ToastManager:
             if not isinstance(mon, (int, str)):
                 mon = "primary"
             data["monitor"] = mon
-            # Serialize to string FIRST to prevent partial file writes / corruption
             serialized = json.dumps(data, indent=2)
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 f.write(serialized)
@@ -1428,7 +1323,6 @@ class ToastManager:
         self.root.after(0, self.quit)
 
     def _load_logo(self):
-        """Fetches the Nighty logo directly from the official URL."""
         try:
             req = urllib.request.Request(
                 NIGHTY_LOGO_URL, headers={"User-Agent": "Mozilla/5.0"}
@@ -1465,8 +1359,6 @@ class ToastManager:
                 toast.update_logo()
         except Exception as e:
             log(f"failed to create logo PhotoImage: {e}")
-
-    # -- placement ----------------------------------------------------------
 
     def get_monitor_geometry(self):
         monitors = get_monitors()
@@ -1537,8 +1429,6 @@ class ToastManager:
         base -= sum(t.height + self.GAP for t in self.active)
         return base - height
 
-    # -- loop ---------------------------------------------------------------
-
     _last_tray_sync = 0
 
     def pump(self):
@@ -1584,7 +1474,6 @@ class ToastManager:
             return
         if event.get("kind") == "toast":
             if not self._is_duplicate(event):
-                # 1. Record in history for "Recent Notifications"
                 self.history.insert(0, {
                     "title": event.get("title") or "Nighty",
                     "text": event.get("text") or "",
@@ -1595,12 +1484,10 @@ class ToastManager:
                 if len(self.history) > 10:
                     self.history.pop()
 
-                # 2. Check Do Not Disturb
                 if self.dnd:
                     log("suppressed toast: DND active")
                     return
 
-                # 3. Check Fullscreen Game suppression
                 if self.suppress_fullscreen and is_foreground_fullscreen():
                     log("suppressed toast: foreground window is fullscreen")
                     return
@@ -1608,7 +1495,6 @@ class ToastManager:
                 self.render(event)
 
     def _is_duplicate(self, event):
-        """Filters duplicate notifications arriving from multiple VPS paths (showToast vs NotificationCenter)."""
         now = time.time()
         self._recent_events = [e for e in self._recent_events if now - e["time"] < 15]
 
@@ -1621,10 +1507,8 @@ class ToastManager:
                 norm = norm[len(prefix):]
 
         for e in self._recent_events:
-            # 1. Same Discord message link
             if url and e.get("url") and url == e["url"]:
                 return True
-            # 2. Same normalized content
             if norm and e.get("norm"):
                 if norm == e["norm"] or (len(norm) > 10 and (norm in e["norm"] or e["norm"] in norm)):
                     return True
@@ -1633,9 +1517,6 @@ class ToastManager:
         return False
 
     def apply_config(self, event):
-        """Applies `/settings toastsettings` from the VPS: side, duration_ms,
-        image_url. Only touches what Nighty actually defines; everything else
-        keeps coming from toast_client.json. With follow_vps=false, ignored."""
         if not self.cfg.get("follow_vps", True) or not event.get("follow", True):
             return
 
@@ -1730,7 +1611,7 @@ def main():
               "Fill in host, port and token, then run it again.")
         return
     if cfg is False:
-        return                      # broken JSON; load_config already warned
+        return
 
     if cfg["host"] == DEFAULTS["host"] or cfg["token"] == DEFAULTS["token"]:
         alert("Nighty Remote Toast",
