@@ -143,26 +143,78 @@ def alert(title, message, kind="info"):
         root.destroy()
 
 
-def single_instance():
-    """True when this is the only client running.
+_mutex = None
+_lock_socket = None
+_manager_instance = None
 
-    Binding a local port is the most reliable single-instance lock on Windows
-    without dependencies: without SO_REUSEADDR the second bind fails. The socket
-    stays open until the process dies, and the OS releases it even on a crash.
+
+def ensure_single_instance():
+    """Guarantees that it is impossible to have two instances running simultaneously.
+
+    1. Checks a Win32 Named Mutex ('Local\\NightyToastClient_Mutex').
+    2. Binds a local TCP socket on 127.0.0.1:48888.
+    3. If another instance is already running:
+       Sends a 'WAKEUP' ping to the existing instance so it brings up a toast
+       notifying the user that it is already active in the system tray,
+       and then this process exits immediately without spawning another instance.
     """
-    global _lock
+    global _mutex, _lock_socket
+
+    # 1. Win32 Named Mutex
+    try:
+        import ctypes
+        ERROR_ALREADY_EXISTS = 183
+        mutex_name = "Local\\NightyToastClient_Mutex"
+        _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+        if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            _notify_existing_and_exit()
+            return False
+    except Exception as e:
+        log(f"mutex check warning: {e}")
+
+    # 2. Local Socket Lock
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("127.0.0.1", LOCK_PORT))
-        s.listen(1)
-        _lock = s
-        return True
+        s.listen(2)
+        _lock_socket = s
     except OSError:
         try:
             s.close()
         except Exception:
             pass
+        _notify_existing_and_exit()
         return False
+
+    # Start listener thread for wakeup pings from subsequent launch attempts
+    def _listen_for_pings():
+        while True:
+            try:
+                conn, _ = _lock_socket.accept()
+                data = conn.recv(128)
+                conn.close()
+                if b"WAKEUP" in data:
+                    if _manager_instance:
+                        _manager_instance.root.after(0, _manager_instance.on_second_instance_launch)
+            except Exception:
+                break
+
+    threading.Thread(target=_listen_for_pings, daemon=True).start()
+    return True
+
+
+def _notify_existing_and_exit():
+    """Signals the existing instance that another launch was attempted, then exits immediately."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.5)
+        s.connect(("127.0.0.1", LOCK_PORT))
+        s.sendall(b"WAKEUP\n")
+        s.close()
+    except Exception:
+        pass
+    log("Another client instance was launched; notified existing instance and exiting.")
+    sys.exit(0)
 
 
 def load_config():
@@ -839,10 +891,16 @@ class ToastManager:
     GAP = 12
 
     def __init__(self, cfg):
+        global _manager_instance
+        _manager_instance = self
+
         self.cfg = cfg
         self.active = []
         self.queue = queue.Queue()
         self.online = False
+        self._recent_events = []
+        self._raw_logo_bytes = None
+        self.tray_icon = None
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -854,6 +912,9 @@ class ToastManager:
         # Fetch official Nighty logo from URL asynchronously
         self.nighty_logo = None
         self._load_logo()
+
+        # Initialize official Nighty System Tray Icon
+        self._init_tray()
 
         self.avatars = AvatarCache(
             enabled=bool(cfg.get("avatar", False)),
@@ -867,6 +928,112 @@ class ToastManager:
         self.reader.start()
         self.root.after(100, self.pump)
 
+    def on_second_instance_launch(self):
+        """Notifies the user via toast when a second launch attempt is blocked."""
+        self.render({
+            "title": "Nighty Remote Toast",
+            "text": "Client is already running in the system tray!",
+            "type": "INFO",
+        })
+
+    def _create_tray_image(self):
+        """Generates the official Nighty 'N' tray icon (64x64 RGBA)."""
+        try:
+            from PIL import Image, ImageDraw
+            import io
+
+            if self._raw_logo_bytes:
+                try:
+                    logo = Image.open(io.BytesIO(self._raw_logo_bytes)).convert("RGBA")
+                    canvas = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+                    logo.thumbnail((54, 54), Image.Resampling.LANCZOS)
+                    x = (64 - logo.width) // 2
+                    y = (64 - logo.height) // 2
+                    canvas.paste(logo, (x, y), logo)
+                    return canvas
+                except Exception:
+                    pass
+
+            # Fallback vector 'N' icon
+            canvas = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(canvas)
+            draw.rounded_rectangle((2, 2, 61, 61), radius=16, fill=(1, 4, 24, 255), outline=(64, 160, 198, 255), width=2)
+            draw.line([(18, 46), (18, 18)], fill=(64, 160, 198, 255), width=6)
+            draw.line([(18, 18), (46, 46)], fill=(64, 160, 198, 255), width=6)
+            draw.line([(46, 46), (46, 18)], fill=(64, 160, 198, 255), width=6)
+            return canvas
+        except Exception as e:
+            log(f"_create_tray_image: {e}")
+            return None
+
+    def _init_tray(self):
+        """Initializes the official Nighty System Tray Icon with status menu."""
+        try:
+            import pystray
+
+            tray_img = self._create_tray_image()
+            if tray_img is None:
+                return
+
+            menu = pystray.Menu(
+                pystray.MenuItem("Nighty Remote Toast", None, enabled=False),
+                pystray.MenuItem(lambda item: f"Status: {'Connected' if self.online else 'Connecting...'}", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Send Test Toast", self._tray_test_toast, default=True),
+                pystray.MenuItem("Open Settings (JSON)", self._tray_open_settings),
+                pystray.MenuItem("Open Log", self._tray_open_log),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Restart Client", self._tray_restart),
+                pystray.MenuItem("Quit Client", self._tray_quit),
+            )
+
+            status_text = "Connected" if self.online else "Connecting..."
+            self.tray_icon = pystray.Icon(
+                "NightyToast",
+                tray_img,
+                f"Nighty Remote Toast ({status_text})",
+                menu
+            )
+            self.tray_icon.run_detached()
+        except Exception as e:
+            log(f"tray icon init failed: {e}")
+            self.tray_icon = None
+
+    def _tray_test_toast(self, _icon=None, _item=None):
+        self.root.after(0, lambda: self.render({
+            "title": "Nighty Remote Toast",
+            "text": "Tray icon is active and client is running properly!",
+            "type": "SUCCESS",
+        }))
+
+    def _tray_open_settings(self, _icon=None, _item=None):
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(CONFIG_PATH)
+        except Exception as e:
+            log(f"failed to open config: {e}")
+
+    def _tray_open_log(self, _icon=None, _item=None):
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(LOG_PATH)
+        except Exception as e:
+            log(f"failed to open log: {e}")
+
+    def _tray_restart(self, _icon=None, _item=None):
+        def _do_restart():
+            try:
+                import subprocess
+                subprocess.Popen([sys.executable, os.path.abspath(__file__)],
+                                 cwd=HERE, close_fds=True)
+            except Exception as e:
+                log(f"restart failed: {e}")
+            self.quit()
+        self.root.after(0, _do_restart)
+
+    def _tray_quit(self, _icon=None, _item=None):
+        self.root.after(0, self.quit)
+
     def _load_logo(self):
         """Fetches the Nighty logo directly from the official URL."""
         try:
@@ -874,6 +1041,7 @@ class ToastManager:
                 NIGHTY_LOGO_URL, headers={"User-Agent": "Mozilla/5.0"}
             )
             raw = urllib.request.urlopen(req, timeout=3).read()
+            self._raw_logo_bytes = raw
             self.nighty_logo = tk.PhotoImage(data=raw)
         except Exception as e:
             log(f"initial logo fetch failed ({e}); retrying in background")
@@ -891,7 +1059,15 @@ class ToastManager:
 
     def _apply_logo(self, raw_bytes):
         try:
+            self._raw_logo_bytes = raw_bytes
             self.nighty_logo = tk.PhotoImage(data=raw_bytes)
+            if self.tray_icon:
+                try:
+                    new_icon = self._create_tray_image()
+                    if new_icon:
+                        self.tray_icon.icon = new_icon
+                except Exception:
+                    pass
             for toast in list(self.active):
                 toast.update_logo()
         except Exception as e:
@@ -948,6 +1124,11 @@ class ToastManager:
         if status == "online":
             if not self.online:
                 self.online = True
+                if self.tray_icon:
+                    try:
+                        self.tray_icon.title = f"Nighty Remote Toast - Connected ({self.cfg['host']}:{self.cfg['port']})"
+                    except Exception:
+                        pass
                 self.render({
                     "title": "Connected",
                     "text": f"Connected to {self.cfg['host']}:{self.cfg['port']}",
@@ -956,6 +1137,11 @@ class ToastManager:
             return
         if status == "offline":
             self.online = False
+            if self.tray_icon:
+                try:
+                    self.tray_icon.title = "Nighty Remote Toast - Connecting..."
+                except Exception:
+                    pass
             return
         if status == "auth":
             self.render({
@@ -968,7 +1154,33 @@ class ToastManager:
             self.apply_config(event)
             return
         if event.get("kind") == "toast":
-            self.render(event)
+            if not self._is_duplicate(event):
+                self.render(event)
+
+    def _is_duplicate(self, event):
+        """Filters duplicate notifications arriving from multiple VPS paths (showToast vs NotificationCenter)."""
+        now = time.time()
+        self._recent_events = [e for e in self._recent_events if now - e["time"] < 15]
+
+        url = event.get("url")
+        raw_text = f"{event.get('title', '')} {event.get('text', '')}".lower()
+        import re
+        norm = re.sub(r"[^a-z0-9]", "", raw_text)
+        for prefix in ("yougotpinged", "ping", "directmessage"):
+            if norm.startswith(prefix):
+                norm = norm[len(prefix):]
+
+        for e in self._recent_events:
+            # 1. Same Discord message link
+            if url and e.get("url") and url == e["url"]:
+                return True
+            # 2. Same normalized content
+            if norm and e.get("norm"):
+                if norm == e["norm"] or (len(norm) > 10 and (norm in e["norm"] or e["norm"] in norm)):
+                    return True
+
+        self._recent_events.append({"time": now, "url": url, "norm": norm})
+        return False
 
     def apply_config(self, event):
         """Applies `/settings toastsettings` from the VPS: side, duration_ms,
@@ -1035,6 +1247,11 @@ class ToastManager:
 
     def quit(self):
         self.reader.stop.set()
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
         try:
             self.root.destroy()
         except Exception:
@@ -1046,13 +1263,7 @@ class ToastManager:
 
 
 def main():
-    if not single_instance():
-        log("another client is already running; exiting.")
-        if not QUIET:
-            alert("Nighty Remote Toast",
-                  "The client is already running.\n\n"
-                  "If you cannot see it, right click a toast and choose "
-                  "'Quit client', or end pythonw.exe in Task Manager.", "warn")
+    if not ensure_single_instance():
         return
 
     cfg = load_config()
