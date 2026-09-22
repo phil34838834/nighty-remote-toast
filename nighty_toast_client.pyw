@@ -19,7 +19,7 @@ Usage
    Nighty, or with `<p>toastbridge token`).
 3. Run it again. The `.pyw` extension means no console window appears.
 
-To start it automatically with Windows, use `nighty_toast_client_autostart.pyw`
+To start it automatically with Windows, use `nighty_toast_autostart.pyw`
 instead - it has a small panel to turn autostart on and off.
 
 To stop it: right click any toast -> "Quit client". If no toast is on screen,
@@ -53,7 +53,7 @@ CONFIG_PATH = os.path.join(HERE, "toast_client.json")
 LOG_PATH = os.path.join(HERE, "toast_client.log")
 
 LOG_LIMIT = 512 * 1024                   # rotate past 512 KB
-LOCK_PORT = 50787                        # local port used only as a single-instance lock
+LOCK_PORT = 48888                        # local port used only as a single-instance lock
 
 # --boot is set by the autostart shortcut. It silences dialogs that make no
 # sense while Windows is still logging in.
@@ -71,14 +71,14 @@ DEFAULTS = {
     "position": "top-right",     # top-left | top-right | bottom-left | bottom-right
     "margin_x": 24,
     "margin_y": 24,
-    "width": 380,
+    "width": 510,
     "duration": 8,               # seconds on screen (0 = stay until clicked)
     "max_visible": 4,
-    "avatar": True,
+    "avatar": False,             # original Nighty uses the authentic vector circle icons
     "avatar_circular": True,
     "sound": False,
     "open_in_app": True,         # open the Discord app instead of the browser
-    "progress_bar": True,        # thin bar showing the remaining time
+    "progress_bar": False,       # original Nighty has no bottom progress bar
     "animate": True,             # slide + fade in
 
     # Obey `/settings toastsettings` from the VPS (side, duration_ms, image_url).
@@ -86,25 +86,36 @@ DEFAULTS = {
     "follow_vps": True,
 }
 
-# Palette mirroring Nighty's own look.
+# Authentic Nighty palette & styling
+TARGET_ALPHA = 0.92
+
 COLORS = {
-    "bg": "#16171A",
-    "bg_hover": "#1C1D21",
-    "border": "#2A2C31",
-    "title": "#F2F3F5",
-    "text": "#B5BAC1",
+    "bg_fallback": "#020306",
+    "title": "#FFFFFF",
+    "text": "#E5E5E5",
     "footer": "#72767D",
-    "close": "#6B7075",
-    "close_hover": "#F2F3F5",
-    "track": "#232529",
+    "close": "#1664B8",
+    "close_hover": "#40A0C6",
 }
+
 ACCENTS = {
-    "INFO": "#40A0C6",           # Nighty blue
-    "SUCCESS": "#43B581",
-    "ERROR": "#ED4245",
-    "WARNING": "#FAA61A",
+    "INFO": "#40A0C6",           # Nighty cyan/blue
+    "SUCCESS": "#43B581",        # Emerald green
+    "ERROR": "#ED4245",          # Red
+    "WARNING": "#FAA61A",        # Amber
 }
-GLYPHS = {"INFO": "i", "SUCCESS": "✓", "ERROR": "!", "WARNING": "!"}
+
+GRADIENTS = {
+    "INFO": ((1, 2, 5), (1, 4, 24)),
+    "SUCCESS": ((1, 3, 1), (8, 22, 10)),
+    "ERROR": ((4, 1, 1), (24, 5, 5)),
+    "WARNING": ((4, 3, 1), (24, 16, 4)),
+}
+
+# Official Nighty 'N' logo URL
+NIGHTY_LOGO_URL = (
+    "https://nighty.one/_next/image?url=%2Fassets%2Fimg%2Fnighty%40500px.png&w=32&q=75"
+)
 
 
 def log(msg):
@@ -264,14 +275,14 @@ class SSEReader(threading.Thread):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Images
+# Images & Graphics Helpers
 # ══════════════════════════════════════════════════════════════════════════
 
 class AvatarCache:
     """Downloads and converts avatars. Tk only reads PNG/GIF, so we ask the
     Discord CDN for PNG explicitly."""
 
-    def __init__(self, enabled=True, circular=True, size=44):
+    def __init__(self, enabled=False, circular=True, size=22):
         self.enabled = enabled
         self.circular = circular
         self.size = size
@@ -319,8 +330,7 @@ class AvatarCache:
         return image
 
     def get_icon(self, url):
-        """Generic icon (the image_url from /settings toastsettings). No circular
-        mask: Nighty's logo is a rounded square, not a circle."""
+        """Generic icon (the image_url from /settings toastsettings)."""
         if not url:
             return None
         if url in self.cache:
@@ -329,10 +339,12 @@ class AvatarCache:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             raw = urllib.request.urlopen(req, timeout=6).read()
-            image = tk.PhotoImage(data=raw)          # Tk reads PNG and GIF
+            image = tk.PhotoImage(data=raw)
             factor = max(1, image.width() // self.size)
             if factor > 1:
                 image = image.subsample(factor, factor)
+            if self.circular:
+                self.mask_circle(image)
         except Exception as e:
             log(f"icon failed ({url}): {type(e).__name__}: {e}")
             image = None
@@ -355,33 +367,90 @@ class AvatarCache:
                     if dx * dx + dy2 > r2:
                         image.transparency_set(x, y, True)
         except Exception:
-            pass          # no mask beats no avatar
+            pass
 
 
-def round_corners(window):
-    """Windows 11 rounded corners through DWM. No-op elsewhere."""
+def make_gradient_ppm(w, h, c1, c2):
+    """Generates an in-memory binary PPM image with a smooth horizontal gradient."""
+    w = max(1, int(w))
+    h = max(1, int(h))
+    row = bytearray()
+    for x in range(w):
+        t = x / max(1, w - 1)
+        r = int(c1[0] + (c2[0] - c1[0]) * t)
+        g = int(c1[1] + (c2[1] - c1[1]) * t)
+        b = int(c1[2] + (c2[2] - c1[2]) * t)
+        row.extend([r, g, b])
+    return bytes(bytearray(f"P6\n{w} {h}\n255\n".encode("ascii")) + row * h)
+
+
+def make_rounded_gradient(w, h, c1, c2, radius=18):
+    """Generates an in-memory PNG image with a smooth horizontal gradient and rounded corners."""
+    try:
+        from PIL import Image, ImageDraw
+        import io
+
+        w = max(1, int(w))
+        h = max(1, int(h))
+        mask = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rounded_rectangle((0, 0, w - 1, h - 1), radius=radius, fill=255)
+
+        row = bytearray()
+        for x in range(w):
+            t = x / max(1, w - 1)
+            r = int(c1[0] + (c2[0] - c1[0]) * t)
+            g = int(c1[1] + (c2[1] - c1[1]) * t)
+            b = int(c1[2] + (c2[2] - c1[2]) * t)
+            row.extend([r, g, b])
+        base = Image.frombytes("RGB", (w, h), bytes(row * h))
+        base.putalpha(mask)
+
+        bio = io.BytesIO()
+        base.save(bio, format="PNG")
+        return bio.getvalue()
+    except Exception:
+        return make_gradient_ppm(w, h, c1, c2)
+
+
+def round_corners(window, width, height, radius=18):
+    """Applies true OS-level rounded window corners on Windows via GDI region."""
     try:
         import ctypes
         window.update_idletasks()
-        hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
-        DWMWA_WINDOW_CORNER_PREFERENCE = 33
-        DWMWCP_ROUND = 2
-        value = ctypes.c_int(DWMWCP_ROUND)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-            ctypes.byref(value), ctypes.sizeof(value))
-    except Exception:
-        pass
+        hwnd = window.winfo_id()
+        root_hwnd = ctypes.windll.user32.GetAncestor(hwnd, 2)
+        for h in {hwnd, root_hwnd}:
+            if h:
+                rgn = ctypes.windll.gdi32.CreateRoundRectRgn(
+                    0, 0, int(width) + 1, int(height) + 1, int(radius * 2), int(radius * 2)
+                )
+                ctypes.windll.user32.SetWindowRgn(h, rgn, True)
+    except Exception as e:
+        log(f"round_corners: {e}")
 
 
-def rounded_rect(canvas, x1, y1, x2, y2, radius, **kw):
-    """Rounded rectangle on a Canvas - tkinter has no primitive for it."""
-    points = [
-        x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
-        x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
-        x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1,
-    ]
-    return canvas.create_polygon(points, smooth=True, **kw)
+def draw_icon(canvas, x, y, kind, accent):
+    """Draws the authentic Nighty vector circle icon (diameter 22px)."""
+    # Circular outline
+    canvas.create_oval(x, y, x + 22, y + 22, outline=accent, width=2)
+
+    if kind == "SUCCESS":
+        # Checkmark ✓
+        canvas.create_line(x + 6, y + 11, x + 10, y + 16, fill=accent, width=2, capstyle="round")
+        canvas.create_line(x + 10, y + 16, x + 17, y + 6, fill=accent, width=2, capstyle="round")
+    elif kind == "ERROR":
+        # Exclamation mark !
+        canvas.create_line(x + 11, y + 5, x + 11, y + 13, fill=accent, width=2, capstyle="round")
+        canvas.create_oval(x + 10, y + 15, x + 12, y + 17, fill=accent, outline=accent)
+    elif kind == "WARNING":
+        # Exclamation mark !
+        canvas.create_line(x + 11, y + 5, x + 11, y + 13, fill=accent, width=2, capstyle="round")
+        canvas.create_oval(x + 10, y + 15, x + 12, y + 17, fill=accent, outline=accent)
+    else:
+        # INFO: 'i'
+        canvas.create_oval(x + 10, y + 4, x + 12, y + 6, fill=accent, outline=accent)
+        canvas.create_line(x + 11, y + 8, x + 11, y + 17, fill=accent, width=2)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -389,9 +458,8 @@ def rounded_rect(canvas, x1, y1, x2, y2, radius, **kw):
 # ══════════════════════════════════════════════════════════════════════════
 
 class Toast:
-    PADDING_X = 14
-    PADDING_Y = 12
-    ICON = 44
+    PADDING_X = 22
+    PADDING_Y = 18
 
     def __init__(self, manager, event):
         self.manager = manager
@@ -403,129 +471,148 @@ class Toast:
         self.alpha = 0.0
         self.deadline = None
         self.total = 0.0
-        self._image = None        # keeps the reference alive or Tk drops it
+        self._bg_img = None
+        self._avatar_img = None
+        self._anim_step = 0
+        self._anim_total = 22
 
         kind = str(event.get("type", "INFO")).upper()
         accent = ACCENTS.get(kind, ACCENTS["INFO"])
-        width = int(self.cfg.get("width", 380))
+        c1, c2 = GRADIENTS.get(kind, GRADIENTS["INFO"])
+
+        # Nighty width: standard is ~510px matching original screenshots
+        w = int(self.cfg.get("width") or 510)
+        if w == 380:
+            w = 510
+        self.width = w
 
         self.win = tk.Toplevel(manager.root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
         self.win.attributes("-alpha", 0.0)
-        self.win.configure(bg=COLORS["border"])
+        try:
+            self.win.wm_attributes("-transparentcolor", "#000001")
+        except (tk.TclError, AttributeError):
+            pass
+        self.win.configure(bg="#000001")
 
-        outer = tk.Frame(self.win, bg=COLORS["border"])
-        outer.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(self.win, width=w, highlightthickness=0, bd=0, bg="#000001")
+        self.canvas.pack(fill="both", expand=True)
 
-        # The progress track must be packed BEFORE the body: the body expands
-        # to fill the cavity, so anything packed after it would get no space.
-        self.progress = None
-        show_progress = (self.cfg.get("progress_bar", True)
-                         and float(self.cfg.get("duration", 8) or 0) > 0)
-        if show_progress:
-            track = tk.Frame(outer, bg=COLORS["track"], height=2)
-            track.pack(side="bottom", fill="x")
-            track.pack_propagate(False)
-            self.progress = tk.Frame(track, bg=accent, height=2)
-            self.progress.place(x=0, y=0, relwidth=1.0, height=2)
+        title_text = self._clip(event.get("title") or "Nighty", 60)
+        body_text = (event.get("text") or "").strip()
+        footer_text = self._footer(event)
 
-        self.body = tk.Frame(outer, bg=COLORS["bg"])
-        self.body.pack(fill="both", expand=True, padx=1, pady=1)
+        # Content column offset to place it beside the Nighty 'N' logo
+        content_x = 78
+        wrap_width = max(200, w - content_x - 32)
 
-        # Accent stripe down the left edge.
-        tk.Frame(self.body, bg=accent, width=3).pack(side="left", fill="y")
+        # Measure content height dynamically
+        current_bottom = 40
+        t_id = None
+        if body_text:
+            t_id = self.canvas.create_text(
+                content_x, 52, text=body_text,
+                fill=COLORS["text"], font=manager.f_text, anchor="nw", width=wrap_width
+            )
+            self.win.update_idletasks()
+            bbox = self.canvas.bbox(t_id)
+            if bbox:
+                current_bottom = bbox[3]
 
-        inner = tk.Frame(self.body, bg=COLORS["bg"])
-        inner.pack(side="left", fill="both", expand=True,
-                   padx=self.PADDING_X, pady=self.PADDING_Y)
+        f_id = None
+        foot_y = current_bottom + (6 if body_text else 16)
+        if footer_text:
+            f_id = self.canvas.create_text(
+                content_x, foot_y, text=footer_text,
+                fill=COLORS["footer"], font=manager.f_footer, anchor="nw", width=wrap_width
+            )
+            self.win.update_idletasks()
+            bbox_f = self.canvas.bbox(f_id)
+            if bbox_f:
+                current_bottom = bbox_f[3]
 
-        head = tk.Frame(inner, bg=COLORS["bg"])
-        head.pack(fill="x")
+        self.height = max(68, current_bottom + self.PADDING_Y)
 
-        author = event.get("author") or {}
-        image = manager.avatars.get(author.get("avatar"))
-        if image is None:
-            image = manager.default_icon        # /settings toastsettings image_url
+        self.win.geometry(f"{w}x{self.height}")
+        self.canvas.configure(height=self.height)
+        round_corners(self.win, w, self.height, radius=18)
 
-        if image is not None:
-            self._image = image
-            tk.Label(head, image=image, bg=COLORS["bg"], bd=0).pack(
-                side="left", padx=(0, 12))
-            icon_width = self.ICON + 12
-        else:
-            self._badge(head, author.get("name"), accent, kind)
-            icon_width = self.ICON + 12
+        # Draw gradient background (smooth anti-aliased rounded rectangle)
+        self._bg_img = tk.PhotoImage(data=make_rounded_gradient(w, self.height, c1, c2, radius=18))
+        self.canvas.create_image(0, 0, image=self._bg_img, anchor="nw")
 
-        texts = tk.Frame(head, bg=COLORS["bg"])
-        texts.pack(side="left", fill="x", expand=True)
+        # Nighty 'N' logo placed beside the content, vertically centered
+        self.logo_item = None
+        if manager.nighty_logo is not None:
+            logo_y = (self.height - manager.nighty_logo.height()) // 2
+            self.logo_item = self.canvas.create_image(22, logo_y, image=manager.nighty_logo, anchor="nw")
 
-        wrap = max(150, width - icon_width - (self.PADDING_X * 2) - 34)
+        # Notification Type Icon (i / ✓ / !) - Uniform authentic Nighty design across ALL notifications
+        icon_x = content_x
+        icon_y = 18
+        draw_icon(self.canvas, icon_x, icon_y, kind, accent)
+        title_x = icon_x + 34
+        title_y = icon_y + 11
 
-        tk.Label(
-            texts, text=self._clip(event.get("title") or "Nighty", 44),
-            bg=COLORS["bg"], fg=COLORS["title"], font=manager.f_title,
-            anchor="w", justify="left",
-        ).pack(fill="x")
+        # Title
+        self.canvas.create_text(
+            title_x, title_y, text=title_text,
+            fill=COLORS["title"], font=manager.f_title, anchor="w"
+        )
 
-        text = (event.get("text") or "").strip()
-        if text:
-            tk.Label(
-                texts, text=self._clip(text, 220),
-                bg=COLORS["bg"], fg=COLORS["text"], font=manager.f_text,
-                anchor="w", justify="left", wraplength=wrap,
-            ).pack(fill="x", pady=(3, 0))
+        # Close button ('✕') at top-right
+        cx, cy = w - 30, 28
+        self.close_l1 = self.canvas.create_line(
+            cx - 6, cy - 6, cx + 6, cy + 6,
+            fill=COLORS["close"], width=2.5, capstyle="round", tags="close"
+        )
+        self.close_l2 = self.canvas.create_line(
+            cx + 6, cy - 6, cx - 6, cy + 6,
+            fill=COLORS["close"], width=2.5, capstyle="round", tags="close"
+        )
+        # Larger hit area for easy click
+        self.canvas.create_rectangle(w - 52, 0, w, 52, fill="", outline="", tags="close")
 
-        footer = self._footer(event)
-        if footer:
-            tk.Label(
-                inner, text=footer, bg=COLORS["bg"], fg=COLORS["footer"],
-                font=manager.f_footer, anchor="w", justify="left",
-            ).pack(fill="x", pady=(7, 0))
+        # Redraw text above the background
+        if body_text:
+            self.canvas.create_text(
+                content_x, 52, text=body_text,
+                fill=COLORS["text"], font=manager.f_text, anchor="nw", width=wrap_width
+            )
+        if footer_text:
+            self.canvas.create_text(
+                content_x, foot_y, text=footer_text,
+                fill=COLORS["footer"], font=manager.f_footer, anchor="nw", width=wrap_width
+            )
 
-        close = tk.Label(head, text="✕", bg=COLORS["bg"],
-                         fg=COLORS["close"], font=manager.f_close, cursor="hand2")
-        close.pack(side="right", anchor="n")
-        close.bind("<Enter>", lambda e: close.configure(fg=COLORS["close_hover"]))
-        close.bind("<Leave>", lambda e: close.configure(fg=COLORS["close"]))
-        close.bind("<Button-1>", lambda e: self.close())
+        # Remove temporary measurement text objects
+        if t_id:
+            self.canvas.delete(t_id)
+        if f_id:
+            self.canvas.delete(f_id)
 
+        # Context menu
         self.menu = tk.Menu(self.win, tearoff=0)
         self.menu.add_command(label="Close all", command=manager.close_all)
         self.menu.add_separator()
         self.menu.add_command(label="Quit client", command=manager.quit)
 
-        for widget in self._walk(self.win):
-            if widget is close:
-                continue
-            widget.bind("<Button-1>", self.on_click)
-            widget.bind("<Button-3>", self.on_menu)
-            widget.bind("<Enter>", self.on_enter)
-            widget.bind("<Leave>", self.on_leave)
-            if event.get("url"):
-                try:
-                    widget.configure(cursor="hand2")
-                except tk.TclError:
-                    pass
+        # Close button interactions
+        self.canvas.tag_bind("close", "<Button-1>", self.on_close_click)
+        self.canvas.tag_bind("close", "<Enter>", self.on_close_enter)
+        self.canvas.tag_bind("close", "<Leave>", self.on_close_leave)
 
-        self.win.update_idletasks()
-        self.height = self.win.winfo_reqheight()
-        self.win.geometry(f"{width}x{self.height}")
-        round_corners(self.win)
+        # Toast-wide interactions
+        self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<Button-3>", self.on_menu)
+        self.canvas.bind("<Enter>", self.on_enter)
+        self.canvas.bind("<Leave>", self.on_leave)
 
-    # -- building helpers ---------------------------------------------------
+        if event.get("url"):
+            self.canvas.configure(cursor="hand2")
 
-    def _badge(self, parent, name, accent, kind):
-        """No avatar: rounded square badge, like the Notification Center."""
-        size = self.ICON
-        canvas = tk.Canvas(parent, width=size, height=size, bg=COLORS["bg"],
-                           highlightthickness=0, bd=0)
-        rounded_rect(canvas, 1, 1, size - 1, size - 1, 12, fill=accent, outline="")
-        label = (name or "").strip()
-        glyph = label[0].upper() if label else GLYPHS.get(kind, "i")
-        canvas.create_text(size / 2, size / 2 + 1, text=glyph, fill="#FFFFFF",
-                           font=self.manager.f_badge)
-        canvas.pack(side="left", padx=(0, 12))
+    # -- helpers -----------------------------------------------------------
 
     @staticmethod
     def _clip(text, limit):
@@ -549,24 +636,31 @@ class Toast:
             parts.append(f"{len(files)} attachment(s)")
         return "  ·  ".join(parts)
 
-    @staticmethod
-    def _walk(root):
-        stack, out = [root], []
-        while stack:
-            node = stack.pop()
-            out.append(node)
-            stack.extend(node.winfo_children())
-        return out
-
-    def _tint(self, color):
-        for widget in self._walk(self.win):
+    def update_logo(self):
+        """Draws the Nighty logo if it finishes downloading while toast is visible."""
+        if self.manager.nighty_logo is not None and self.logo_item is None and not self.closing:
             try:
-                if widget.cget("bg") in (COLORS["bg"], COLORS["bg_hover"]):
-                    widget.configure(bg=color)
-            except tk.TclError:
+                logo_y = (self.height - self.manager.nighty_logo.height()) // 2
+                self.logo_item = self.canvas.create_image(22, logo_y, image=self.manager.nighty_logo, anchor="nw")
+            except Exception:
                 pass
 
     # -- interaction --------------------------------------------------------
+
+    def on_close_click(self, _e=None):
+        self.close()
+        return "break"
+
+    def on_close_enter(self, _e=None):
+        self.canvas.itemconfig(self.close_l1, fill=COLORS["close_hover"])
+        self.canvas.itemconfig(self.close_l2, fill=COLORS["close_hover"])
+        self.canvas.configure(cursor="hand2")
+
+    def on_close_leave(self, _e=None):
+        self.canvas.itemconfig(self.close_l1, fill=COLORS["close"])
+        self.canvas.itemconfig(self.close_l2, fill=COLORS["close"])
+        if not self.event.get("url"):
+            self.canvas.configure(cursor="")
 
     def on_click(self, _event=None):
         url = self.event.get("url")
@@ -582,25 +676,38 @@ class Toast:
 
     def on_enter(self, _e=None):
         self.paused = True
-        self._tint(COLORS["bg_hover"])
+        try:
+            self.win.attributes("-alpha", min(1.0, TARGET_ALPHA + 0.05))
+        except (tk.TclError, AttributeError):
+            pass
 
     def on_leave(self, _e=None):
         self.paused = False
-        self._tint(COLORS["bg"])
+        try:
+            self.win.attributes("-alpha", TARGET_ALPHA)
+        except (tk.TclError, AttributeError):
+            pass
 
-    # -- lifecycle ----------------------------------------------------------
+    # -- lifecycle & smooth ease-out animation ------------------------------
 
     def show(self, y):
-        x = self.manager.x_for(self.cfg.get("width", 380))
+        x = self.manager.x_for(self.width)
         self.target_x = x
+        self.y = y
+        self.offset = -60 if self.manager.on_left() else 60
+
         if self.cfg.get("animate", True):
-            offset = -36 if self.manager.on_left() else 36
-            self.win.geometry(f"+{x + offset}+{y}")
+            self.win.geometry(f"+{x + self.offset}+{y}")
+            self.win.attributes("-alpha", 0.0)
+            self.win.deiconify()
+            round_corners(self.win, self.width, self.height, radius=18)
+            self._anim_step = 0
+            self._animate_in()
         else:
             self.win.geometry(f"+{x}+{y}")
-        self.y = y
-        self.win.deiconify()
-        self._fade_in()
+            self.win.attributes("-alpha", TARGET_ALPHA)
+            self.win.deiconify()
+            round_corners(self.win, self.width, self.height, radius=18)
 
         duration = float(self.cfg.get("duration", 8) or 0)
         if duration > 0:
@@ -615,21 +722,35 @@ class Toast:
         except (tk.TclError, AttributeError):
             pass
 
-    def _fade_in(self):
-        self.alpha = min(1.0, self.alpha + 0.12)
+    def _animate_in(self):
+        """Smooth cubic ease-out slide-in + fade-in animation."""
+        if self.closing:
+            return
+        self._anim_step += 1
+        t = min(1.0, self._anim_step / self._anim_total)
+        # Cubic ease-out: 1 - (1 - t)^3
+        progress = 1.0 - (1.0 - t) ** 3
+        cur_x = int(self.target_x + self.offset * (1.0 - progress))
+        # Quadratic ease-out for alpha
+        self.alpha = TARGET_ALPHA * (1.0 - (1.0 - t) ** 2)
+
         try:
+            self.win.geometry(f"+{cur_x}+{self.y}")
             self.win.attributes("-alpha", self.alpha)
-            if self.cfg.get("animate", True):
-                offset = -36 if self.manager.on_left() else 36
-                x = int(self.target_x + offset * (1.0 - self.alpha))
-                self.win.geometry(f"+{x}+{self.y}")
         except (tk.TclError, AttributeError):
             return
-        if self.alpha < 1.0:
-            self.win.after(16, self._fade_in)
+
+        if t < 1.0:
+            self.win.after(14, self._animate_in)
+        else:
+            try:
+                self.win.geometry(f"+{self.target_x}+{self.y}")
+                self.win.attributes("-alpha", TARGET_ALPHA)
+            except (tk.TclError, AttributeError):
+                pass
 
     def _tick(self):
-        """Runs the countdown and the progress bar; freezes while hovered."""
+        """Countdown dismiss timer; pauses while mouse hovers."""
         if self.closing:
             return
         try:
@@ -637,9 +758,6 @@ class Toast:
                 self.deadline = time.time() + self._remaining
             else:
                 self._remaining = max(0.0, self.deadline - time.time())
-                if self.progress is not None:
-                    self.progress.place_configure(
-                        relwidth=max(0.0, self._remaining / self.total))
                 if self._remaining <= 0:
                     self.close()
                     return
@@ -658,17 +776,22 @@ class Toast:
                 self.win.after_cancel(self.timer)
             except Exception:
                 pass
+        self._close_step = 0
+        self._close_total = 14
         self._fade_out()
 
     def _fade_out(self):
-        self.alpha -= 0.14
+        """Smooth ease-in fade-out animation."""
+        self._close_step += 1
+        t = min(1.0, self._close_step / self._close_total)
+        fade = max(0.0, TARGET_ALPHA * (1.0 - t ** 2))
         try:
-            if self.alpha <= 0:
+            if t >= 1.0 or fade <= 0.02:
                 self.win.destroy()
                 self.manager.remove(self)
                 return
-            self.win.attributes("-alpha", self.alpha)
-            self.win.after(16, self._fade_out)
+            self.win.attributes("-alpha", fade)
+            self.win.after(14, self._fade_out)
         except tk.TclError:
             self.manager.remove(self)
 
@@ -696,7 +819,6 @@ def open_url(url, prefer_app=True):
 
     target = ("https://discord.com" + path) if path else url
     if target.startswith("discord://"):
-        # No known http equivalent: last resort through the shell.
         try:
             if hasattr(os, "startfile"):
                 os.startfile(target)
@@ -714,7 +836,7 @@ def open_url(url, prefer_app=True):
 # ══════════════════════════════════════════════════════════════════════════
 
 class ToastManager:
-    GAP = 10
+    GAP = 12
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -725,15 +847,18 @@ class ToastManager:
         self.root = tk.Tk()
         self.root.withdraw()
 
-        self.f_title = tkfont.Font(family="Segoe UI", size=10, weight="bold")
-        self.f_text = tkfont.Font(family="Segoe UI", size=9)
-        self.f_footer = tkfont.Font(family="Segoe UI", size=8)
-        self.f_close = tkfont.Font(family="Segoe UI", size=9)
-        self.f_badge = tkfont.Font(family="Segoe UI", size=15, weight="bold")
+        self.f_title = tkfont.Font(family="Segoe UI", size=13, weight="bold")
+        self.f_text = tkfont.Font(family="Segoe UI", size=11)
+        self.f_footer = tkfont.Font(family="Segoe UI", size=9)
+
+        # Fetch official Nighty logo from URL asynchronously
+        self.nighty_logo = None
+        self._load_logo()
 
         self.avatars = AvatarCache(
-            enabled=bool(cfg.get("avatar", True)),
+            enabled=bool(cfg.get("avatar", False)),
             circular=bool(cfg.get("avatar_circular", True)),
+            size=22,
         )
         self.default_icon = None      # from /settings toastsettings image_url
         self.vps_settings = {}
@@ -741,6 +866,36 @@ class ToastManager:
         self.reader = SSEReader(cfg, self.queue)
         self.reader.start()
         self.root.after(100, self.pump)
+
+    def _load_logo(self):
+        """Fetches the Nighty logo directly from the official URL."""
+        try:
+            req = urllib.request.Request(
+                NIGHTY_LOGO_URL, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            raw = urllib.request.urlopen(req, timeout=3).read()
+            self.nighty_logo = tk.PhotoImage(data=raw)
+        except Exception as e:
+            log(f"initial logo fetch failed ({e}); retrying in background")
+            def worker():
+                try:
+                    req = urllib.request.Request(
+                        NIGHTY_LOGO_URL, headers={"User-Agent": "Mozilla/5.0"}
+                    )
+                    raw2 = urllib.request.urlopen(req, timeout=10).read()
+                    self.root.after(0, lambda: self._apply_logo(raw2))
+                except Exception as e2:
+                    log(f"background logo fetch failed: {e2}")
+
+            threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_logo(self, raw_bytes):
+        try:
+            self.nighty_logo = tk.PhotoImage(data=raw_bytes)
+            for toast in list(self.active):
+                toast.update_logo()
+        except Exception as e:
+            log(f"failed to create logo PhotoImage: {e}")
 
     # -- placement ----------------------------------------------------------
 
@@ -794,8 +949,8 @@ class ToastManager:
             if not self.online:
                 self.online = True
                 self.render({
-                    "title": "Nighty Remote Toast",
-                    "text": f"Connected to {self.cfg['host']}:{self.cfg['port']}.",
+                    "title": "Connected",
+                    "text": f"Connected to {self.cfg['host']}:{self.cfg['port']}",
                     "type": "SUCCESS",
                 })
             return
@@ -804,9 +959,8 @@ class ToastManager:
             return
         if status == "auth":
             self.render({
-                "title": "Nighty Remote Toast",
-                "text": "Token rejected by the server. Check the token in "
-                        "toast_client.json.",
+                "title": "ERROR",
+                "text": "Token rejected by the server. Check the token in toast_client.json.",
                 "type": "ERROR",
             })
             return
@@ -850,8 +1004,6 @@ class ToastManager:
         limit = int(self.cfg.get("max_visible", 4))
         while len(self.active) >= limit:
             self.active[0].close()
-            # close() is asynchronous (fade); drop it from the list right away
-            # so the stack does not keep growing.
             if self.active and self.active[0].closing:
                 self.active.pop(0)
                 self.relayout()
