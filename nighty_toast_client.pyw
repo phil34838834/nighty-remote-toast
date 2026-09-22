@@ -29,6 +29,7 @@ end the `pythonw.exe` process in Task Manager (Ctrl+Shift+Esc).
 import json
 import os
 import queue
+import re
 import socket
 import sys
 import threading
@@ -119,6 +120,32 @@ GRADIENTS = {
 NIGHTY_LOGO_URL = (
     "https://nighty.one/_next/image?url=%2Fassets%2Fimg%2Fnighty%40500px.png&w=32&q=75"
 )
+
+
+def init_log():
+    """Clears the log file on client startup/restart and writes a fresh session header."""
+    try:
+        with open(LOG_PATH, "w", encoding="utf-8") as f:
+            f.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] === Nighty Remote Toast Started (PID: {os.getpid()}) ===\n"
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Python: {sys.version.split()[0]} ({sys.executable})\n"
+            )
+    except Exception:
+        pass
+
+
+def safe_int(val, default):
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(val, default):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
 
 
 def log(msg):
@@ -230,7 +257,11 @@ def load_config():
         # utf-8-sig: Windows Notepad saves JSON with a BOM and the plain parser
         # chokes on it. Reading with -sig accepts the file either way.
         with open(CONFIG_PATH, "r", encoding="utf-8-sig", errors="ignore") as f:
-            cfg.update(json.load(f) or {})
+            raw = f.read()
+        # Clean trailing commas (e.g. ", }" or ", ]") and comments
+        cleaned = re.sub(r",\s*([\]}])", r"\1", raw)
+        cleaned = re.sub(r"//.*", "", cleaned)
+        cfg.update(json.loads(cleaned) or {})
     except Exception as e:
         log(f"invalid config: {e}")
         alert("Nighty Remote Toast",
@@ -322,6 +353,8 @@ class SSEReader(threading.Thread):
         try:
             event = json.loads(text)
         except Exception:
+            return
+        if not isinstance(event, dict):
             return
         seq = event.get("seq")
         if isinstance(seq, int):
@@ -669,8 +702,8 @@ class Toast:
         c1, c2 = GRADIENTS.get(kind, GRADIENTS["INFO"])
 
         # Nighty width: standard is ~510px matching original screenshots
-        w = int(self.cfg.get("width") or 510)
-        if w == 380:
+        w = safe_int(self.cfg.get("width"), 510)
+        if w <= 0 or w == 380:
             w = 510
         self.width = w
 
@@ -782,6 +815,13 @@ class Toast:
 
         # Context menu
         self.menu = tk.Menu(self.win, tearoff=0)
+        url = event.get("url")
+        if url:
+            self.menu.add_command(label="Copy Message Link", command=self.copy_link)
+        if body_text:
+            self.menu.add_command(label="Copy Text", command=self.copy_text)
+        if url or body_text:
+            self.menu.add_separator()
         self.menu.add_command(label="Close all", command=manager.close_all)
         self.menu.add_separator()
         self.menu.add_command(label="Quit client", command=manager.quit)
@@ -850,6 +890,26 @@ class Toast:
         if not self.event.get("url"):
             self.canvas.configure(cursor="")
 
+    def copy_link(self):
+        url = self.event.get("url")
+        if url:
+            try:
+                self.win.clipboard_clear()
+                self.win.clipboard_append(url)
+                self.win.update()
+            except Exception as e:
+                log(f"copy_link error: {e}")
+
+    def copy_text(self):
+        text = (self.event.get("text") or "").strip()
+        if text:
+            try:
+                self.win.clipboard_clear()
+                self.win.clipboard_append(text)
+                self.win.update()
+            except Exception as e:
+                log(f"copy_text error: {e}")
+
     def on_click(self, _event=None):
         url = self.event.get("url")
         if url:
@@ -897,7 +957,7 @@ class Toast:
             self.win.deiconify()
             round_corners(self.win, self.width, self.height, radius=18)
 
-        duration = float(self.cfg.get("duration", 8) or 0)
+        duration = safe_float(self.cfg.get("duration"), 8.0)
         if duration > 0:
             self.total = duration
             self.deadline = time.time() + duration
@@ -1193,25 +1253,31 @@ class ToastManager:
                     return True
                 return str(cur) == str(val)
 
+            def _make_mon_action(m_idx):
+                return lambda _icon, _item: self._tray_set_monitor(m_idx)
+
+            def _make_mon_checker(m_idx):
+                return lambda item: _is_mon_checked(m_idx)
+
             display_items = [
-                pystray.MenuItem("Primary Display", lambda _: self._tray_set_monitor("primary"),
+                pystray.MenuItem("Primary Display", lambda _icon, _item: self._tray_set_monitor("primary"),
                                  checked=lambda item: _is_mon_checked("primary")),
             ]
             if len(monitors) > 1:
                 display_items.append(
-                    pystray.MenuItem("Secondary Display", lambda _: self._tray_set_monitor("secondary"),
+                    pystray.MenuItem("Secondary Display", lambda _icon, _item: self._tray_set_monitor("secondary"),
                                      checked=lambda item: _is_mon_checked("secondary"))
                 )
             for idx, m in enumerate(monitors, 1):
                 label = f"Monitor {idx} ({m['width']}x{m['height']})" + (" [Primary]" if m["primary"] else "")
                 display_items.append(
-                    pystray.MenuItem(label, lambda _, i=idx: self._tray_set_monitor(i),
-                                     checked=lambda item, i=idx: _is_mon_checked(i))
+                    pystray.MenuItem(label, _make_mon_action(idx),
+                                     checked=_make_mon_checker(idx))
                 )
 
             menu = pystray.Menu(
-                pystray.MenuItem("Nighty Remote Toast", None, enabled=False),
-                pystray.MenuItem(lambda item: f"Status: {'Connected' if self.online else 'Connecting...'}", None, enabled=False),
+                pystray.MenuItem("Nighty Remote Toast", self._tray_show_status),
+                pystray.MenuItem(lambda item: f"Status: {'Connected' if self.online else 'Connecting...'}", self._tray_show_status, default=True),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Recent Notifications", pystray.Menu(self._get_history_menu_items)),
                 pystray.MenuItem("Display", pystray.Menu(*display_items)),
@@ -1223,7 +1289,7 @@ class ToastManager:
                 pystray.MenuItem("Start with Windows", self._tray_toggle_autostart,
                                  checked=lambda item: is_autostart_enabled()),
                 pystray.Menu.SEPARATOR,
-                pystray.MenuItem("Open Settings (JSON)", self._tray_open_settings, default=True),
+                pystray.MenuItem("Open Settings (JSON)", self._tray_open_settings),
                 pystray.MenuItem("Open Log", self._tray_open_log),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Restart Client", self._tray_restart),
@@ -1238,9 +1304,40 @@ class ToastManager:
                 menu
             )
             self.tray_icon.run_detached()
+            self._update_tray_status()
         except Exception as e:
             log(f"tray icon init failed: {e}")
             self.tray_icon = None
+
+    def _update_tray_status(self):
+        """Syncs the tray icon tooltip and menu items with the current connection status."""
+        if not self.tray_icon:
+            return
+        try:
+            if self.online:
+                self.tray_icon.title = f"Nighty Remote Toast - Connected ({self.cfg['host']}:{self.cfg['port']})"
+            else:
+                self.tray_icon.title = "Nighty Remote Toast - Connecting..."
+            self.tray_icon.update_menu()
+        except Exception as e:
+            log(f"update_tray_status error: {e}")
+
+    def _tray_show_status(self, _icon=None, _item=None):
+        """Displays a quick status toast notification when left-clicking the tray icon."""
+        mon = self.cfg.get("monitor", "primary")
+        dnd_str = "ON" if self.dnd else "OFF"
+        fs_str = "ON" if self.suppress_fullscreen else "OFF"
+        status_str = "Connected" if self.online else "Connecting..."
+        kind = "SUCCESS" if self.online else "WARNING"
+
+        info = (f"Server: {self.cfg['host']}:{self.cfg['port']}\n"
+                f"Display: {mon}  ·  DND: {dnd_str}  ·  Game Mute: {fs_str}")
+
+        self.root.after(0, lambda: self.render({
+            "title": f"Status: {status_str}",
+            "text": info,
+            "type": kind,
+        }))
 
     def _tray_toggle_dnd(self, _icon=None, _item=None):
         self.dnd = not self.dnd
@@ -1266,22 +1363,39 @@ class ToastManager:
     def _save_cfg(self):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
-                data = json.load(f)
-            data["dnd"] = self.dnd
-            data["suppress_in_fullscreen"] = self.suppress_fullscreen
-            data["monitor"] = self.cfg.get("monitor", "primary")
+                raw = f.read()
+            cleaned = re.sub(r",\s*([\]}])", r"\1", raw)
+            cleaned = re.sub(r"//.*", "", cleaned)
+            data = json.loads(cleaned) or {}
+            data["dnd"] = bool(self.dnd)
+            data["suppress_in_fullscreen"] = bool(self.suppress_fullscreen)
+            mon = self.cfg.get("monitor", "primary")
+            if not isinstance(mon, (int, str)):
+                mon = "primary"
+            data["monitor"] = mon
+            # Serialize to string FIRST to prevent partial file writes / corruption
+            serialized = json.dumps(data, indent=2)
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+                f.write(serialized)
         except Exception as e:
             log(f"failed to save config: {e}")
 
     def _tray_set_monitor(self, mon_val):
-        self.cfg["monitor"] = mon_val
+        if isinstance(mon_val, str):
+            val = mon_val.lower().strip()
+        elif isinstance(mon_val, int):
+            val = mon_val
+        else:
+            try:
+                val = int(mon_val)
+            except Exception:
+                val = "primary"
+        self.cfg["monitor"] = val
         self._save_cfg()
         self.root.after(0, self.relayout)
         self.root.after(0, lambda: self.render({
             "title": "Display Changed",
-            "text": f"Toasts will now appear on {mon_val} display.",
+            "text": f"Toasts will now appear on {val} display.",
             "type": "INFO",
         }))
 
@@ -1392,14 +1506,14 @@ class ToastManager:
 
     def x_for(self, width):
         mx, my, mw, mh = self.get_monitor_geometry()
-        margin = int(self.cfg.get("margin_x", 24))
+        margin = safe_int(self.cfg.get("margin_x"), 24)
         if self.on_left():
             return mx + margin
         return mx + mw - width - margin
 
     def relayout(self):
         mx, my, mw, mh = self.get_monitor_geometry()
-        margin = int(self.cfg.get("margin_y", 24))
+        margin = safe_int(self.cfg.get("margin_y"), 24)
         if self.on_top():
             y = my + margin
             for t in self.active:
@@ -1416,7 +1530,7 @@ class ToastManager:
 
     def next_y(self, height):
         mx, my, mw, mh = self.get_monitor_geometry()
-        margin = int(self.cfg.get("margin_y", 24))
+        margin = safe_int(self.cfg.get("margin_y"), 24)
         if self.on_top():
             return my + margin + sum(t.height + self.GAP for t in self.active)
         base = my + mh - margin
@@ -1425,12 +1539,18 @@ class ToastManager:
 
     # -- loop ---------------------------------------------------------------
 
+    _last_tray_sync = 0
+
     def pump(self):
         try:
             while True:
                 self.handle(self.queue.get_nowait())
         except queue.Empty:
             pass
+        now = time.time()
+        if now - self._last_tray_sync > 3.0:
+            self._last_tray_sync = now
+            self._update_tray_status()
         self.root.after(100, self.pump)
 
     def handle(self, event):
@@ -1438,24 +1558,19 @@ class ToastManager:
         if status == "online":
             if not self.online:
                 self.online = True
-                if self.tray_icon:
-                    try:
-                        self.tray_icon.title = f"Nighty Remote Toast - Connected ({self.cfg['host']}:{self.cfg['port']})"
-                    except Exception:
-                        pass
+                self._update_tray_status()
                 self.render({
                     "title": "Connected",
                     "text": f"Connected to {self.cfg['host']}:{self.cfg['port']}",
                     "type": "SUCCESS",
                 })
+            else:
+                self._update_tray_status()
             return
         if status == "offline":
-            self.online = False
-            if self.tray_icon:
-                try:
-                    self.tray_icon.title = "Nighty Remote Toast - Connecting..."
-                except Exception:
-                    pass
+            if self.online:
+                self.online = False
+                self._update_tray_status()
             return
         if status == "auth":
             self.render({
@@ -1548,7 +1663,7 @@ class ToastManager:
         self.relayout()
 
     def render(self, event):
-        limit = int(self.cfg.get("max_visible", 4))
+        limit = safe_int(self.cfg.get("max_visible"), 4)
         while len(self.active) >= limit:
             self.active[0].close()
             if self.active and self.active[0].closing:
@@ -1561,9 +1676,13 @@ class ToastManager:
             log("failed to build toast:\n" + traceback.format_exc())
             return
 
-        y = self.next_y(toast.height)
-        self.active.append(toast)
-        toast.show(y)
+        try:
+            y = self.next_y(toast.height)
+            self.active.append(toast)
+            toast.show(y)
+        except Exception:
+            log("failed to show toast:\n" + traceback.format_exc())
+            return
 
         if self.cfg.get("sound") and winsound is not None:
             try:
@@ -1601,6 +1720,8 @@ def main():
     if not ensure_single_instance():
         return
 
+    init_log()
+
     cfg = load_config()
 
     if cfg is None:
@@ -1616,6 +1737,8 @@ def main():
               "The configuration still has the example values.\n\n"
               f"Edit {CONFIG_PATH} and fill in host and token.", "warn")
         return
+
+    log(f"Config loaded: host={cfg.get('host')}, port={cfg.get('port')}, monitor={cfg.get('monitor')}, dnd={cfg.get('dnd')}, fullscreen_mute={cfg.get('suppress_in_fullscreen')}")
 
     ToastManager(cfg).run()
 
